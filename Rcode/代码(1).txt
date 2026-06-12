@@ -1,0 +1,1073 @@
+library(tseries)
+library(forecast)
+library(rugarch)
+library(moments)
+library(ggplot2)
+
+# 自定义ARCH-LM检验函数
+arch_lm_test <- function(x, lags=5) {
+  x2 <- x^2; n <- length(x2)
+  X <- sapply(1:lags, function(i) c(rep(NA,i), x2[1:(n-i)]))
+  fit <- lm(x2[(lags+1):n] ~ X[(lags+1):n,])
+  LM <- (n-lags)*summary(fit)$r.squared
+  p.value <- 1-pchisq(LM, lags)
+  return(list(statistic=LM, p.value=p.value))
+}
+
+# ===================== 数据读取 =====================
+data <- read.csv("/mnt/d/zcc/data/yidaiyilu(1).csv", fill = FALSE)
+returns_full <- data[, c( "hushen300", "ydlMIB","xxlNZ50","nfFTSE","bxBOVESPA")]
+colnames(returns_full) <- c( "hushen300", "ydlMIB","xxlNZ50","nfFTSE","bxBOVESPA")
+returns_full <- na.omit(returns_full)
+assets <- colnames(returns_full)
+# 单独提取日期列（和returns_full行数完全一致）
+data_clean <- na.omit(data)  # 整体去除缺失值（保证日期和指数行一一对应）
+data_clean$date <- as.Date(data_clean$date, format = "%Y-%m-%d")
+date_all <- data_clean$date
+# 2. 设置随机种子（确保每次运行结果一致）
+set.seed(123) 
+# 3. 按照 8:2 的比例划分索引（按时间顺序切分）
+n <- nrow(returns_full)
+train_size <- round(n * 0.8)  # 8：2 划分
+train_index <- 1:train_size           # 前80%作为训练集1944
+test_index <- (train_size + 1):n      # 后20%作为测试集486
+# 4. 划分数据集（同步划分日期 + 收益率）
+returns <- returns_full[train_index, ]        # 训练集指数
+test_returns <- returns_full[test_index, ]    # 测试集指数
+date_train <- date_all[train_index]
+date_test <- date_all[test_index]
+
+# ===================== 第一步：五个变量的描述性统计 =====================
+cat("\n========== 五个变量的描述性统计 ==========\n")
+# 使用 colMeans 和 apply 计算统计量
+desc_stats <- data.frame(
+  Variable = assets,
+  Mean = colMeans(returns_full, na.rm = TRUE),
+  Std = apply(returns_full, 2, sd, na.rm = TRUE),
+  Skew = apply(returns_full, 2, skewness, na.rm = TRUE),
+  Kurt = apply(returns_full, 2, kurtosis, na.rm = TRUE)
+)
+print(desc_stats)
+
+
+# ======================时序图========================
+# ===================== 分别绘制五个变量的收益率时序图 =====================
+if (!require("ggplot2")) install.packages("ggplot2")
+library(ggplot2)
+
+# ===================== 绘图（优化横轴密度） =====================
+for (var in assets) {
+  plot_df <- data.frame(
+    time = date_all,
+    ret = returns_full[, var]
+  )
+  
+  p <- ggplot(plot_df, aes(x = time, y = ret)) +
+    geom_line(color = "steelblue", linewidth = 0.6) +
+    labs(title = paste(var, "日收益率序列图"),
+         x = "交易日期",
+         y = "收益率 (%)") +
+    # ========== 核心新增：自定义日期刻度 ==========
+  scale_x_date(
+    date_breaks = "1 year",        # 每1年一个刻度
+    date_labels = "%Y",            # 只显示4位年份
+    expand = c(0.02, 0.02)
+  ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  print(p)
+}
+
+# ===================== 诊断：绘制 ARMA 残差的平方图 =====================
+#cat("\n========== 诊断：检查残差是否存在波动聚集 ==========\n")
+#for (var in assets) {
+#  # 1. 拟合 ARMA 提取残差
+#  fit_arma <- auto.arima(returns[, var], max.p=3, max.q=3, ic="aicc", seasonal=FALSE)
+#  res <- residuals(fit_arma)
+
+#  # 2. 绘制残差平方图（这是看 ARCH 效应的金标准）
+#  plot(res^2, type='l', main=paste(var, "- Squared Residuals"), col="darkred")
+#  abline(h=mean(res^2), lty=2) # 添加均值线作为参考
+#}
+
+
+# ===================== JB、ADF、ARCH-LM 检验（带显著性标记） =====================
+library(FinTS)
+cat("\n========== 平稳性、正态性与ARCH效应检验 ==========\n")
+# 表头
+cat(sprintf("%-12s %-22s %-22s %-18s\n", "变量", "JB统计量", "ADF统计量","ARCH-LM(5) p值"))
+
+# 逐个变量计算
+for (var in assets) {
+  # JB检验（正态性）-针对训练集原始序列
+  jb_test <- jarque.bera.test(returns[, var])
+  jb_out <- sprintf("%.4f(%.4f)", as.numeric(jb_test$statistic), jb_test$p.value)
+  
+  # ADF检验（平稳性）-针对训练集原始序列
+  adf_test <- suppressWarnings(adf.test(returns[, var], alternative = "stationary"))
+  adf_out <- sprintf("%.4f(%.4f)", as.numeric(adf_test$statistic), adf_test$p.value)
+  
+  # --- 关键步骤：先拟合 ARMA 模型获取残差 ---
+  # 限制最大阶数防止过拟合，使用 AICc 准则
+  fit_arma <- auto.arima(returns[, var], ic = "aicc", max.p = 5, max.q = 5, seasonal = FALSE, trace = FALSE)
+  res_arma <- residuals(fit_arma) # 提取标准化残差
+  
+  # ARCH-LM检验（滞后5阶）：判断是否需要GARCH
+  # P值应 小于 0.05（显著），说明存在异方差，必须上 GARCH 模型。
+  arch_res <- ArchTest(res_arma, lags = 5)
+  arch_p <- arch_res$p.value
+  
+  if (arch_p < 0.01) {
+    arch_out <- sprintf("%.4f***", arch_p)
+  } else if (arch_p < 0.05) {
+    arch_out <- sprintf("%.4f**", arch_p)
+  } else if (arch_p < 0.1) {
+    arch_out <- sprintf("%.4f*", arch_p)
+  } else {
+    arch_out <- sprintf("%.4f", arch_p)
+  }
+  
+  # 输出一行，统计量保留4位小数
+  cat(sprintf("%-12s %-22s %-22s %-18s\n",
+              var,jb_out, adf_out, arch_out))
+}
+##白噪声检验
+lag_vec <- c(1,2,3,4)
+var_list <- colnames(returns_full)
+
+# 批量提取p值矩阵
+p_matrix <- sapply(var_list, function(v){
+  sapply(lag_vec, function(l){
+    Box.test(returns_full[,v], lag=l, type="Ljung-Box")$p.value
+  })
+})
+rownames(p_matrix) <- paste0("lag_",lag_vec)
+print(p_matrix)
+
+
+
+# ======================ARMA-GARCH模型阶数===================
+for (var in c( "hushen300", "ydlMIB","xxlNZ50","nfFTSE","bxBOVESPA")) {
+  x <- returns[, var]
+  cat("\n处理变量：", var, "\n")
+  # 1. 确定 ARMA 阶数（使用 auto.arima，限制 p ≤ 3, q ≤ 5）
+  library(forecast)
+  fit_arma <- auto.arima(x, ic = "aicc", max.p = 3, max.q = 5, seasonal = FALSE)
+  ar_order <- fit_arma$arma[1]
+  ma_order <- fit_arma$arma[2]
+  cat("选定的 ARMA 阶数：(", ar_order, ",", ma_order, ")\n")
+  
+  # 2. 确定 GARCH 阶数（假设正态分布，遍历候选阶数，选择 AIC 最小的）
+  library(rugarch)
+  garch_orders <- list(c(1,1), c(1,2), c(2,1))
+  best_aic <- Inf
+  best_order <- NULL
+  
+  for (order in garch_orders) {
+    spec <- ugarchspec(
+      variance.model = list(model = "sGARCH", garchOrder = order),
+      mean.model     = list(armaOrder = c(ar_order, ma_order), include.mean = TRUE),
+      distribution.model = "norm"
+    )
+    fit_temp <- ugarchfit(spec = spec, data = x, solver = "hybrid")
+    aic_val <- infocriteria(fit_temp)[1]
+    if (aic_val < best_aic) {
+      best_aic <- aic_val
+      best_order <- order
+    }
+  }
+  cat("选定的 GARCH 阶数：(", best_order[1], ",", best_order[2], ")\n")
+}
+# 假设 returns 已经计算好
+library(rugarch)
+
+
+
+##########################假设标准化残差服从std
+####################std
+library(rugarch)
+library(ggplot2)
+
+specs <- list(
+  hushen300 = list(armaOrder = c(0,2), garchOrder = c(1,1), dist = "std"),
+  ydlMIB    = list(armaOrder = c(0,2), garchOrder = c(1,1), dist = "std"),
+  xxlNZ50   = list(armaOrder = c(2,2), garchOrder = c(1,1), dist = "std"),
+  nfFTSE    = list(armaOrder = c(3,1), garchOrder = c(1,1), dist = "std"),
+  bxBOVESPA = list(armaOrder = c(0,1), garchOrder = c(1,1), dist = "std")
+)
+
+fit_list <- list()
+z_list   <- list()
+u_list   <- list()
+
+for (var in names(specs)) {
+  cat("\n========== 变量：", var, "==========\n")
+  
+  spec <- ugarchspec(
+    variance.model = list(model = "gjrGARCH", garchOrder = specs[[var]]$garchOrder),
+    mean.model     = list(armaOrder = specs[[var]]$armaOrder, include.mean = TRUE),
+    distribution.model = specs[[var]]$dist
+  )
+  
+  fit <- ugarchfit(
+    spec = spec,
+    data = returns[, var],
+    solver = "hybrid",
+    solver.control = list(max.iter = 2000)
+  )
+  
+  print(round(coef(fit), 6))
+  fit_list[[var]] <- fit
+  
+  z <- residuals(fit, standardize = TRUE)   # 当前变量的标准化残差
+  coefs <- coef(fit)
+  shape_val <- as.numeric(coefs["shape"])    # 当前变量的t分布自由度
+
+  z_list[[var]] <- z
+  # ========== 残差诊断 ==========
+  cat("\n--- 残差诊断 ---\n")
+  
+  # 1. Ljung-Box
+  for (lag in c(5,10,15)) {
+    lb <- Box.test(z, lag=lag, type="Ljung-Box")
+    cat(sprintf("LB lag%d: p=%.4f %s\n", lag, lb$p.value, ifelse(lb$p.value>0.05,"√","×")))
+  }
+
+  # 2. ARCH-LM
+  for (lag in c(5,10)) {
+    arch <- arch_lm_test(z, lags=lag)
+    cat(sprintf("ARCH lag%d: p=%.4f %s\n", lag, arch$p.value, ifelse(arch$p.value>0.05,"√","×")))
+  }
+  
+  # ========== PIT ==========
+  u <- rugarch::pdist(
+    distribution = "std",
+    q = z,
+    mu = 0,
+    sigma = 1,
+    shape = shape_val
+  )
+  u_list[[var]] <- u
+  
+  # 画图
+  hist(u, breaks = 30, main = paste(var, "PIT均匀分布"),
+       xlab = "u", prob = TRUE, col = "lightblue")
+  abline(h = 1, lty = 2, col = "red", lwd = 2)
+  
+  ks_u <- ks.test(u, "punif")
+  cat("\nPIT均匀性KS p值：", ks_u$p.value, "\n")
+}
+
+# ================================================
+# 保存最终的 Copula 输入数据
+write.csv(u_list, "/mnt/d/zcc/data/11_u_list.csv", row.names = FALSE)
+############
+
+
+
+###################检验集
+# 检验集：只做过滤 + PIT 
+cat("\n========== 开始处理检验集 ==========\n")
+
+u_test_list <- list()
+z_test_list <- list()
+test_fit_list <- list() # 【新增】：用来装检验集的 GARCH 过滤对象
+
+for (var in names(specs)) {
+  cat("\n========== 变量：", var, " (检验集) ==========\n")
+  
+  # 获取训练集拟合好的模型
+  fit_train <- fit_list[[var]]
+  
+  # 提取训练集估计出的所有参数
+  train_coefs <- coef(fit_train)
+  
+  # 重新创建 spec，并通过 fixed.pars 传入训练集参数（关键！）
+  spec_filter <- ugarchspec(
+    variance.model = list(model = "gjrGARCH", garchOrder = specs[[var]]$garchOrder),
+    mean.model     = list(armaOrder = specs[[var]]$armaOrder, include.mean = TRUE),
+    distribution.model = specs[[var]]$dist,
+    fixed.pars = as.list(train_coefs)  # 将训练集参数固定传入
+  )
+  
+  # 对检验集进行过滤（不重新估计参数）
+  fit_test <- ugarchfilter(spec = spec_filter, data = test_returns[, var])
+  test_fit_list[[var]] <- fit_test # 【新增】：把过滤好的模型存起来
+  
+  # 提取标准化残差
+  z_test <- residuals(fit_test, standardize = TRUE)
+  z_test_list[[var]] <- z_test
+  
+  # 提取 t 分布参数（来自训练集）
+  shape <- as.numeric(train_coefs["shape"])
+  
+  # PIT 转换
+  u_test <- rugarch::pdist(distribution = "std", q = z_test, 
+                           mu = 0, sigma = 1, shape = shape)
+  u_test_list[[var]] <- u_test
+
+u_test_matrix <- do.call(cbind, u_test_list)
+colnames(u_test_matrix) <- names(u_test_list)
+
+write.csv(u_test_matrix, "/mnt/d/zcc/data/11_u_test.csv", row.names = FALSE)
+
+cat("\n========== 检验集处理完成，数据已保存 ==========\n")
+
+# 整理训练集矩阵
+u_train_matrix <- do.call(cbind, u_list)
+colnames(u_train_matrix) <- names(u_list)
+# 定义变量名顺序
+var_names <- c( "hushen300", "ydlMIB","xxlNZ50","nfFTSE","bxBOVESPA")
+# 【核心新增】：把 Copula 和算风险溢出所需要的所有底层零件打包存为 RData
+save(u_train_matrix, u_test_matrix, fit_list, test_fit_list, var_names, 
+     file = "/mnt/d/zcc/data/11Marginal_Full_Data.RData")
+cat("\n========== 检验集处理完成，数据已完整保存 ==========\n")
+
+
+
+
+
+
+
+install.packages(c("VineCopula", "fracdiff", "tseries", "copula"))
+library(VineCopula)
+library(fracdiff)
+library(copula)
+########################vine-copula的选择
+# ================================
+# 1. 导入数据
+# ================================
+data82 <- read.csv( "/mnt/d/zcc/data/11_u_list.csv",fill = FALSE)
+# ================================
+# 2. Kendall秩相关系数检验
+# ================================
+tau_matrix <- cor(data82, method = "kendall")
+cat("Kendall's tau 矩阵:\n")
+print(tau_matrix)
+ # A. 剔除缺失值
+data_clean <- na.omit(data82)
+
+# B. 【核心修复】强制提取数值列并转为纯矩阵
+# 1. 筛选出所有是数值的列
+numeric_cols <- sapply(data_clean, is.numeric)
+
+# 检查是否还有数值列
+if(sum(numeric_cols) == 0) stop("错误：数据中没有找到任何数值类型的列！")
+
+# 2. 提取这些列，并强制转换为 matrix
+# 这一步至关重要，它确保了 data_matrix 是纯数字矩阵，而不是 data.frame
+data_matrix <- as.matrix(data_clean[, numeric_cols])
+
+# C. 再次检查样本量
+if (nrow(data_matrix) < 30) {
+  stop(paste("错误：有效样本量太少（", nrow(data_matrix), "行），无法构建 Vine 模型！"))
+}
+
+# D. 检查并剔除方差为 0 的列
+# 现在 data_matrix 已经是纯数字矩阵了，这里绝对不会报错
+col_vars <- apply(data_matrix, 2, var)
+
+if(any(col_vars == 0)) {
+  cat("发现方差为0的列，正在自动剔除...\n")
+  # 保留方差不为0的列
+  data_matrix <- data_matrix[, col_vars > 0, drop = FALSE]
+  
+  if (ncol(data_matrix) < 2) {
+    stop("错误：剔除常数列后，剩余变量不足2个，无法建模！")
+  }
+}
+
+# E. 转换为伪观测值 (Pseudo-observations)
+data_pobs <- pobs(data_matrix)
+
+# F. 动态提取变量（防止列名变化导致报错）
+# 建议不要硬编码列名，而是根据矩阵的列名来赋值
+var_names <- colnames(data_pobs)
+cat("当前用于建模的变量为:", paste(var_names, collapse=", "), "\n")
+
+# 假设你的五个变量依然叫c( "hushen300", "ydlMIB","xxlNZ50","nfFTSE","bxBOVESPA")
+# 为了安全，加一个判断
+need_vars <- c( "hushen300", "ydlMIB","xxlNZ50","nfFTSE","bxBOVESPA")
+if(all(need_vars %in% var_names)){
+  u_hushen300 <- data_pobs[,"hushen300"]
+  u_ydlMIB <- data_pobs[, "ydlMIB"]
+  u_xxlNZ50 <- data_pobs[, "xxlNZ50"]
+  u_nfFTSE <- data_pobs[, "nfFTSE"]
+  u_bxBOVESPA <- data_pobs[, "bxBOVESPA"]
+} else {
+  # 如果列名变了，按顺序赋值（需确保顺序正确）
+  u_hushen300 <- data_pobs[,1]
+  u_ydlMIB <- data_pobs[, 2]
+  u_xxlNZ50 <- data_pobs[, 3]
+  u_nfFTSE <- data_pobs[, 4]
+  u_bxBOVESPA <- data_pobs[, 5]
+}
+# ==========================================
+# 3. 自动选择最优 Vine Copula 结构并筛选尾部模型
+
+#RVine
+# ==========================================
+# 候选族：高斯(1)、t(2)、Clayton(3)、Gumbel(4)、Frank(5)、SJC(10)
+tail_families <- c(1,2,3,4,5,10) 
+cat("=== 正在自动构建最优 Vine Copula 结构... ===\n")
+# type = "RVine" 让算法自动在 D-Vine（链式结构）和 C-Vine（星型结构）中择优
+# selection.criterion = "AIC" 使用赤池信息量准则，保证模型既精准又不过度复杂
+rvine_result <- RVineStructureSelect(data_pobs, 
+                                   type = "RVine", 
+                                   selectioncrit = "AIC",
+                                   familyset = tail_families)
+
+# --- 第三步：输出 Vine Copula 结构摘要与尾部系数 ---
+##静态估计的参数
+summary(rvine_result)
+
+
+#CVine
+# ==========================================
+# 候选族：高斯(1)、t(2)、Clayton(3)、Gumbel(4)、Frank(5)、SJC(10)
+tail_families <- c(1,2,3,4,5,10) 
+cat("=== 正在自动构建最优 Vine Copula 结构... ===\n")
+# type = "RVine" 让算法自动在 D-Vine（链式结构）和 C-Vine（星型结构）中择优
+# selection.criterion = "AIC" 使用赤池信息量准则，保证模型既精准又不过度复杂
+cvine_result <- RVineStructureSelect(data_pobs, 
+                                   type = "CVine", 
+                                   selectioncrit = "AIC",
+                                   familyset = tail_families)
+
+# --- 第三步：输出 Vine Copula 结构摘要与尾部系数 ---
+##静态估计的参数
+summary(cvine_result)
+
+#DVine
+# 假设 u_data 是你的 5 列伪观测值数据
+library(VineCopula)
+library(TSP)  # 用于解决"旅行商问题"确定最优变量顺序
+# 假设 u_data 是你的5列伪观测值数据
+# 变量顺序：stock, bonds, currency, futures, goldmarket
+# 步骤1：计算 Kendall's tau 矩阵
+#   最开始已有
+# 步骤2：转换为距离矩阵（1 - |tau|）
+dist_matrix <- 1 - abs(tau_matrix)
+# 步骤3：用 TSP 求解最优的 D-vine 变量顺序
+# 插入 dummy 节点用于处理 TSP 回路
+hamilton <- insert_dummy(TSP(dist_matrix), label = "cut")
+sol <- solve_TSP(hamilton, method = "repetitive_nn")
+order <- cut_tour(sol, "cut")
+cat("D-vine 最优变量顺序:", order, "\n")
+# 步骤4：根据顺序创建 D-vine 的 R-vine 矩阵表示
+dvine_matrix <- D2RVine(order, family = rep(0, length(order)*(length(order)-1)/2), 
+                        par = rep(0, length(order)*(length(order)-1)/2))
+# 步骤5：在给定的 D-vine 结构下，用 RVineCopSelect 选择最优的 pair-copula 类型
+dvine_result <- RVineCopSelect(data_pobs, 
+                               familyset = c(1,2,3,4,5,10) ,
+                               Matrix = dvine_matrix$Matrix)
+# 查看结果
+summary(dvine_result)
+
+
+# ========== 比较三个模型 ==========
+comparison <- data.frame(
+  Model = c("R-vine", "C-vine", "D-vine"),
+  LogLik = c(rvine_result$logLik, cvine_result$logLik, dvine_result$logLik),
+  AIC = c(rvine_result$AIC, cvine_result$AIC, dvine_result$AIC),
+  BIC = c(rvine_result$BIC, cvine_result$BIC, dvine_result$BIC)
+)
+print(comparison)
+# 找出最优模型
+best_idx <- which.min(comparison$AIC)
+cat("\n最优模型（按AIC）：", comparison$Model[best_idx], 
+    "\nAIC =", comparison$AIC[best_idx])
+#####################确定使用D-Vine Copula
+
+
+
+
+
+
+
+
+############D-Vine-FIGAS copula参数拟合
+# 
+# 1. 加载必要的包
+library(rugarch)
+library(VineCopula)
+library(numDeriv)
+library(MASS) # 用于生成模拟数据
+library(numDeriv)
+# =====================================================================
+# 模块 0: 准备工作与模拟数据生成
+# （实际使用时，请用你的真实数据 data82 替换这一块）
+#=====================================================================
+set.seed(123)
+# ================================
+# 1. 导入数据
+# ================================
+u_train <- read.csv( "/mnt/d/zcc/data/11_u_list.csv",fill = FALSE)
+u_test <- read.csv( "/mnt/d/zcc/data/11_u_test.csv",fill = FALSE)
+n_train <- 1944
+n_test <- 486
+# 【加上新的 RData 导入】
+# 这个动作不会覆盖你的 u_train 和 u_test (因为 RData 里的名字叫 u_train_matrix)
+# 它的核心作用是把包含了波动率的 test_fit_list 悄悄带进内存里
+load("/mnt/d/zcc/data/11Marginal_Full_Data.RData")
+
+# =====================================================================
+# 模块 1: 环境准备与数据重排序（依据 D-Vine 顺序）
+# =====================================================================
+library(VineCopula)
+library(numDeriv)
+
+# D-Vine 顺序（根据图示）: 2(bonds), 4(futures), 5(goldmarket), 1(stock), 3(currency)
+order_dvine <- c(2, 4, 5, 1, 3)
+var_names_dvine <- c("ydlMIB", "nfFTSE", "bxBOVESPA", "hushen300", "xxlNZ50")
+u_train <- u_train[, order_dvine]   # 假设 u_train 已存在
+u_test  <- u_test[, order_dvine]    # 假设 u_test 已存在
+n_train <- nrow(u_train)
+n_test  <- nrow(u_test)
+
+# ----------------------------- 2. 核心动态函数定义 ----------------------------------------
+# 分数阶差分权重（截断30期）
+frac_weights <- function(d, max_lag = 30) {
+  weights <- numeric(max_lag)
+  weights[1] <- 1
+  for (k in 1:(max_lag - 1)) {
+    weights[k + 1] <- weights[k] * (k - 1 - d) / k
+  }
+  return(weights)
+}
+
+# FIGAS 过滤函数（支持 family 2,14,23,3 以及通用后备）
+# 修正后的 FIGAS 过滤函数（去掉了所有字面意义的 '...'）
+# 终极修正版 FIGAS 过滤函数 (解决 numDeriv 向量化与 Copula 崩溃问题)
+# 最强抗崩溃版 FIGAS 过滤函数：手写求导 + NA 防火墙
+filter_figas_correct <- function(theta, u1, u2, fam_id) {
+  mu <- theta[1]; alpha <- theta[2]; beta <- theta[3]; d <- theta[4]
+  kappa <- if (fam_id == 2) theta[5] else 0
+  
+  T_len <- length(u1)
+  y <- numeric(T_len)        
+  g_t <- numeric(T_len)      
+  par_t <- numeric(T_len)
+  ll_seq <- numeric(T_len)
+  scores <- numeric(T_len)
+  
+  # 预计算分数差分系数
+  psi <- numeric(T_len)
+  psi[1] <- -d          
+  if (T_len > 1) {
+    for (j in 2:T_len) {
+      psi[j] <- psi[j-1] * (j-1-d) / j
+    }
+  }
+  
+  y[1] <- 0
+  g_t[1] <- mu
+  
+  for (t in 1:T_len) {
+    # ----- 1. 计算 copula 参数 (带极值保护) -----
+    if (fam_id == 2) {
+      par_t[t] <- (exp(g_t[t]) - 1) / (exp(g_t[t]) + 1)
+      par_t[t] <- max(min(par_t[t], 0.98), -0.98)
+    } else if (fam_id == 14) {
+      par_t[t] <- exp(g_t[t]) + 1.0001
+      par_t[t] <- max(min(par_t[t], 30), 1.0001)
+    } else if (fam_id == 23) {
+      par_t[t] <- -exp(g_t[t]) - 1e-4
+      par_t[t] <- max(min(par_t[t], -1e-4), -30)
+    } else if (fam_id == 3) {
+      par_t[t] <- exp(g_t[t]) + 1e-4
+      par_t[t] <- max(min(par_t[t], 30), 1e-4)
+    } else {
+      par_t[t] <- exp(g_t[t]) + 1.0001
+      par_t[t] <- max(min(par_t[t], 30), 1.0001)
+    }
+    
+    # ----- 2. 对数似然 (带 tryCatch 强力拦截) -----
+    pdf_val <- tryCatch({
+      BiCopPDF(u1[t], u2[t], family = fam_id, par = par_t[t], par2 = kappa)
+    }, error = function(e) 1e-10)
+    
+    if (is.na(pdf_val) || pdf_val <= 0) pdf_val <- 1e-10
+    ll_seq[t] <- log(pdf_val)
+    
+    # ----- 3. 计算得分（全面抛弃 numDeriv）-----
+    if (fam_id == 2) {
+      x1 <- qt(u1[t], df = kappa)
+      x2 <- qt(u2[t], df = kappa)
+      mt <- (x1^2 + x2^2 - 2*par_t[t]*x1*x2) / (1 - par_t[t]^2)
+      pit <- (kappa + 2) / (kappa + mt)
+      dot_rho <- 2 * exp(g_t[t]) / (exp(g_t[t]) + 1)^2
+      nabla <- (dot_rho / (1 - par_t[t]^2)^2) * ((1 + par_t[t]^2)*(pit*x1*x2 - par_t[t]) - par_t[t]*(pit*x1^2 + pit*x2^2 - 2))
+      Info <- (dot_rho^2 / (1 - par_t[t]^2)^2) * (1 + par_t[t]^2 - 2*par_t[t]^2/(kappa+2)) * ((kappa+2)/(kappa+4))
+      scores[t] <- nabla / sqrt(max(Info, 1e-8))
+    } else {
+      # 纯手写中心差分求导 (速度飞快，绝不报错)
+      eval_logpdf <- function(g) {
+        if (is.na(g) || is.infinite(g)) return(log(1e-10))
+        if (fam_id == 14) {
+          tp <- max(min(exp(g) + 1.0001, 30), 1.0001)
+        } else if (fam_id == 23) {
+          tp <- max(min(-exp(g) - 1e-4, -1e-4), -30)
+        } else if (fam_id == 3) {
+          tp <- max(min(exp(g) + 1e-4, 30), 1e-4)
+        } else {
+          tp <- max(min(exp(g) + 1.0001, 30), 1.0001)
+        }
+        v <- tryCatch({
+          BiCopPDF(u1[t], u2[t], family=fam_id, par=tp, par2=kappa)
+        }, error = function(e) 1e-10)
+        if (is.na(v) || v <= 0) v <- 1e-10
+        return(log(v))
+      }
+      
+      h_step <- 1e-5
+      f_plus <- eval_logpdf(g_t[t] + h_step)
+      f_minus <- eval_logpdf(g_t[t] - h_step)
+      scores[t] <- (f_plus - f_minus) / (2 * h_step)
+    }
+    
+    # 【NA 防火墙 1】绝对不允许 score 为 NA
+    if (is.na(scores[t]) || is.infinite(scores[t])) {
+      scores[t] <- 0 
+    }
+    scores[t] <- max(min(scores[t], 10), -10)
+    
+    # ----- 4. 更新下一期的 y_{t+1} -----
+    if (t < T_len) {
+      sum_psi_y <- 0
+      L <- 100
+      if (t >= 1) {
+        max_j <- min(L, t)
+        for (j in 1:max_j) {
+          sum_psi_y <- sum_psi_y + psi[j] * y[t+1-j]
+        }
+      }
+      y[t+1] <- beta * y[t] + alpha * scores[t] - sum_psi_y
+      
+      # 【NA 防火墙 2】绝对不允许 y 为 NA，切断毒源
+      if (is.na(y[t+1]) || is.infinite(y[t+1])) {
+        y[t+1] <- 0 
+      }
+      g_t[t+1] <- mu + y[t+1]
+    }
+  }
+  
+  # ----- 5. 计算 h 函数（带容错机制）-----
+  h1 <- h2 <- numeric(T_len)
+  for (t in 1:T_len) {
+    h_vals <- tryCatch({
+      BiCopHfunc(u1[t], u2[t], family = fam_id, par = par_t[t], par2 = kappa)
+    }, error = function(e) list(hfunc1 = u1[t], hfunc2 = u2[t])) # 若出错，退化为独立 Copula，保住 Tree 模型不全盘崩溃
+    
+    h1[t] <- if(!is.null(h_vals$hfunc1) && !is.na(h_vals$hfunc1)) h_vals$hfunc1 else u1[t]
+    h2[t] <- if(!is.null(h_vals$hfunc2) && !is.na(h_vals$hfunc2)) h_vals$hfunc2 else u2[t]
+  }
+  
+  return(list(loglik = sum(ll_seq), ll_seq = ll_seq, par_t = par_t,
+              h1 = h1, h2 = h2, y = y))
+}
+
+# GAS(1,1) 过滤函数（与 FIGAS 类似，但更新方程不同）
+filter_gas <- function(theta, u1, u2, family) {
+  mu <- theta[1]; alpha <- theta[2]; beta <- theta[3]
+  kappa <- ifelse(family == 2, theta[4], 0)
+  
+  T <- length(u1)
+  g_t <- rep(mu, T)
+  par_t <- rep(0, T)
+  scores <- rep(0, T)
+  ll_seq <- rep(0, T)
+  
+  for (t in 1:T) {
+    # 链接函数（同 FIGAS）
+    if (family == 2) {
+      par_t[t] <- (exp(g_t[t]) - 1) / (exp(g_t[t]) + 1)
+      par_t[t] <- max(min(par_t[t], 0.98), -0.98)
+    } else if (family == 14) {
+      par_t[t] <- exp(g_t[t]) + 1.0001
+      par_t[t] <- max(par_t[t], 1.0001)
+    } else if (family == 23) {
+      par_t[t] <- -exp(g_t[t]) - 1e-4
+      par_t[t] <- max(par_t[t], -30)
+    } else if (family == 3) {
+      par_t[t] <- exp(g_t[t]) + 1e-4
+      par_t[t] <- max(par_t[t], 1e-4)
+    } else {
+      par_t[t] <- exp(g_t[t]) + 1.0001
+    }
+    
+    # 对数似然
+    pdf_val <- BiCopPDF(u1[t], u2[t], family = family, par = par_t[t], par2 = kappa)
+    ll_seq[t] <- log(max(pdf_val, 1e-10))
+    
+    # 得分（与 FIGAS 相同）
+    if (family == 2) {
+      x1 <- qt(u1[t], df = kappa); x2 <- qt(u2[t], df = kappa)
+      mt <- (x1^2 + x2^2 - 2*par_t[t]*x1*x2) / (1 - par_t[t]^2)
+      pit <- (kappa + 2) / (kappa + mt)
+      dot_rho <- 2 * exp(g_t[t]) / (exp(g_t[t]) + 1)^2
+      nabla <- (dot_rho / (1 - par_t[t]^2)^2) * ((1 + par_t[t]^2)*(pit*x1*x2 - par_t[t]) - par_t[t]*(pit*x1^2 + pit*x2^2 - 2))
+      Info <- (dot_rho^2 / (1 - par_t[t]^2)^2) * (1 + par_t[t]^2 - 2*par_t[t]^2/(kappa+2)) * ((kappa+2)/(kappa+4))
+      scores[t] <- nabla / sqrt(max(Info, 1e-8))
+    } else {
+      eval_s_g <- function(g_val) {
+        if (family == 2) temp_par <- (exp(g_val)-1)/(exp(g_val)+1)
+        else if (family == 14) temp_par <- exp(g_val) + 1.0001
+        else if (family == 23) temp_par <- -exp(g_val) - 1e-4
+        else if (family == 3) temp_par <- exp(g_val) + 1e-4
+        else temp_par <- exp(g_val) + 1.0001
+        log(max(BiCopPDF(u1[t], u2[t], family=family, par=temp_par, par2=kappa), 1e-10))
+      }
+      scores[t] <- grad(eval_s_g, x = g_t[t])
+      scores[t] <- max(min(scores[t], 10), -10)
+    }
+    
+    # GAS(1,1) 更新: g_{t+1} = μ + β*(g_t - μ) + α*s_t
+    if (t < T) {
+      g_t[t+1] <- mu + beta * (g_t[t] - mu) + alpha * scores[t]
+    }
+  }
+  
+  # h-function
+  h1 <- h2 <- numeric(T)
+  for (t in 1:T) {
+    h_vals <- BiCopHfunc(u1[t], u2[t], family = family, par = par_t[t], par2 = kappa)
+    h1[t] <- h_vals$hfunc1
+    h2[t] <- h_vals$hfunc2
+  }
+  
+  return(list(loglik = sum(ll_seq), ll_seq = ll_seq, par_t = par_t,
+              h1 = h1, h2 = h2))
+}
+
+# ----------------------------- 3. D-Vine 树结构定义 ----------------------------------------
+# 每条边: list(v1, v2, cond, family)
+# 变量索引按重排后顺序: 1=bonds, 2=futures, 3=goldmarket, 4=stock, 5=currency
+dvine_structure <- list(
+  tree1 = list(
+    list(v1=1, v2=2, cond=NULL, family=14),   # (1,2) Survival Gumbel
+    list(v1=2, v2=3, cond=NULL, family=2),    # (2,3) t
+    list(v1=3, v2=4, cond=NULL, family=2),    # (3,4) t
+    list(v1=4, v2=5, cond=NULL, family=14)    # (4,5) Survival Gumbel
+  ),
+  tree2 = list(
+    list(v1=1, v2=3, cond=2, family=2),       # (1,3|2) t
+    list(v1=2, v2=4, cond=3, family=2),       # (2,4|3) t
+    list(v1=3, v2=5, cond=4, family=2)        # (3,5|4) t
+  ),
+  tree3 = list(
+    list(v1=1, v2=4, cond=c(2,3), family=2),  # (1,4|2,3) t
+    list(v1=2, v2=5, cond=c(3,4), family=23)  # (2,5|3,4) Clayton 90°
+  ),
+  tree4 = list(
+    list(v1=1, v2=5, cond=c(2,3,4), family=3) # (1,5|2,3,4) Clayton
+  )
+)
+
+# ----------------------------- 4. 通用训练函数（单模型）------------------------------------
+# 训练 D-Vine 并返回各边结果及总似然
+train_dvine <- function(u_data, model_type) {
+  n <- nrow(u_data)
+  results <- list()
+  total_ll <- 0
+  
+  for (tree_idx in 1:4) {
+    cat(sprintf("\n=================================================\n"))
+    cat(sprintf("-> 正在构建 D-Vine Tree %d ...\n", tree_idx))
+    cat(sprintf("=================================================\n"))
+    
+    tree_edges <- dvine_structure[[tree_idx]]
+    n_edges <- length(tree_edges)
+    results[[tree_idx]] <- list()
+    
+    for (e in 1:n_edges) {
+      edge <- tree_edges[[e]]
+      v1 <- edge$v1; v2 <- edge$v2; fam <- edge$family
+      
+      # ----- 获取 u1, u2 序列（同前）-----
+      if (tree_idx == 1) {
+        uu1 <- u_data[, v1]
+        uu2 <- u_data[, v2]
+      } else if (tree_idx == 2) {
+        uu1 <- results[[1]][[e]]$h1
+        uu2 <- results[[1]][[e+1]]$h2
+      } else if (tree_idx == 3) {
+        if (e == 1) {
+          uu1 <- results[[2]][[1]]$h1
+          uu2 <- results[[2]][[2]]$h2
+        } else if (e == 2) {
+          uu1 <- results[[2]][[2]]$h1
+          uu2 <- results[[2]][[3]]$h2
+        }
+      } else if (tree_idx == 4) {
+        uu1 <- results[[3]][[1]]$h1
+        uu2 <- results[[3]][[2]]$h2
+      }
+      
+      # 打印边信息
+      cat(sprintf("   Edge %d (vars %d-%d, family %d)...\n", e, v1, v2, fam))
+      
+      # ----- 模型估计 -----
+      if (model_type == "static") {
+        fit <- BiCopEst(uu1, uu2, family = fam, method = "mle")
+        par_static <- fit$par
+        par2_static <- ifelse(fam == 2, fit$par2, 0)
+        hvals <- BiCopHfunc(uu1, uu2, family = fam, par = par_static, par2 = par2_static)
+        loglik <- sum(log(pmax(BiCopPDF(uu1, uu2, family = fam, par = par_static, par2 = par2_static), 1e-10)))
+        
+        # 输出静态参数
+        if (fam == 2) {
+          cat(sprintf("      --> [静态参数] par(rho): %.4f, kappa(df): %.2f\n", par_static, par2_static))
+        } else {
+          cat(sprintf("      --> [静态参数] par(rho/theta): %.4f\n", par_static))
+        }
+        cat(sprintf("      --> [模型拟合] 该 Edge 对数似然: %.2f\n", loglik))
+        
+        res <- list(loglik = loglik, h1 = hvals$hfunc1, h2 = hvals$hfunc2,
+                    params = list(par = par_static, par2 = par2_static), fam = fam)
+        
+      } else if (model_type == "figas") {
+        # 静态初值
+        fit <- BiCopEst(uu1, uu2, family = fam, method = "mle")
+        start_rho <- fit$par
+        start_kappa <- ifelse(fam == 2, fit$par2, 0)
+        
+        # 计算起始 mu
+        get_start_mu <- function(f, r) {
+          if (f == 2) {
+            r_safe <- max(min(r, 0.95), -0.95)
+            return(log((1+r_safe)/(1-r_safe)))
+          } else if (f == 14) {
+            return(log(r - 1.0001))
+          } else if (f == 23) {
+            return(log(-r - 1e-4))
+          } else if (f == 3) {
+            return(log(r + 1e-4))
+          } else {
+            return(log(r - 1.0001))
+          }
+        }
+        start_mu <- get_start_mu(fam, start_rho)
+        
+        # ==========================================
+        # 纯净优化区：移除惩罚项，尊重原始数据
+        # ==========================================
+        
+        # 1. 动态生成初始值（保留这个机制，帮助算法探索不同的似然面）
+        init_alpha <- runif(1, 0.02, 0.08)
+        init_beta  <- runif(1, 0.50, 0.90)
+        init_d     <- runif(1, 0.10, 0.35) 
+        
+        # 确保初始 mu 不会太离谱
+        start_mu <- max(min(start_mu, 5), -5)
+        init_par <- c(start_mu, init_alpha, init_beta, init_d)
+        
+        # 2. 设定合理的物理边界 (允许 d 下探到 0.05)
+        # 参数顺序: mu, alpha, beta, d
+        lower <- c(-8,  0.001, 0.001, 0.05) 
+        upper <- c( 8,  0.35,  0.99, 0.49) 
+        
+        if (fam == 2) {
+          init_par <- c(init_par, max(3, start_kappa))
+          lower <- c(lower, 2.1)
+          upper <- c(upper, 30)
+        }
+        
+        # 3. 纯粹的目标函数（极大似然，无任何人工干预）
+        obj <- function(theta) {
+          tmp <- filter_figas_correct(theta, uu1, uu2, fam) 
+          if (is.na(tmp$loglik) || is.infinite(tmp$loglik)) return(1e10)
+          return(-tmp$loglik)
+        }
+        
+        # 使用 nlminb 快速求解
+        opt <- tryCatch(
+          nlminb(start = init_par, objective = obj, lower = lower, upper = upper, 
+                 control = list(iter.max = 300, eval.max = 400)),
+          error = function(e) list(par = init_par)
+        )
+        best <- opt$par
+        
+        # 计算最终真实拟合结果
+        fres <- filter_figas_correct(best, uu1, uu2, fam)
+        
+        # 打印结果
+        if (fam == 2) {
+          cat(sprintf("      --> [静态参数] par(rho): %.4f, kappa(df): %.2f\n", start_rho, start_kappa))
+          cat(sprintf("      --> [动态参数] mu: %.4f, alpha: %.4f, beta: %.4f, d: %.4f, kappa(df): %.2f\n", 
+                      best[1], best[2], best[3], best[4], best[5]))
+        } else {
+          cat(sprintf("      --> [静态参数] par(rho/theta): %.4f\n", start_rho))
+          cat(sprintf("      --> [动态参数] mu: %.4f, alpha: %.4f, beta: %.4f, d: %.4f\n", 
+                      best[1], best[2], best[3], best[4]))
+        }
+        cat(sprintf("      --> [模型拟合] 该 Edge 真实对数似然: %.2f\n", fres$loglik))
+        
+        res <- list(loglik = fres$loglik, h1 = fres$h1, h2 = fres$h2,
+                    params = best, fam = fam, par_seq = fres$par_t)
+      }
+      else if (model_type == "gas") {
+        # 类似 FIGAS，但输出格式一致
+        fit <- BiCopEst(uu1, uu2, family = fam, method = "mle")
+        start_rho <- fit$par
+        start_kappa <- ifelse(fam == 2, fit$par2, 0)
+        
+        get_start_mu <- function(f, r) {
+          if (f == 2) {
+            r_safe <- max(min(r, 0.95), -0.95)
+            return(log((1+r_safe)/(1-r_safe)))
+          } else if (f == 14) {
+            return(log(r - 1.0001))
+          } else if (f == 23) {
+            return(log(-r - 1e-4))
+          } else if (f == 3) {
+            return(log(r + 1e-4))
+          } else {
+            return(log(r - 1.0001))
+          }
+        }
+        start_mu <- get_start_mu(fam, start_rho)
+        
+        init_par <- c(start_mu, 0.05, 0.8)
+        lower <- c(-15, 0.001, 0.01)
+        upper <- c(15, 0.4, 0.99)
+        if (fam == 2) {
+          init_par <- c(init_par, max(3, start_kappa))
+          lower <- c(lower, 2.1)
+          upper <- c(upper, 30)
+        }
+        
+        obj <- function(theta) {
+          tmp <- filter_gas(theta, uu1, uu2, fam)
+          if (is.na(tmp$loglik) || is.infinite(tmp$loglik)) return(1e10)
+          return(-tmp$loglik)
+        }
+        opt <- tryCatch(optim(init_par, obj, method="L-BFGS-B", lower=lower, upper=upper),
+                        error = function(e) list(par=init_par))
+        best <- opt$par
+        fres <- filter_gas(best, uu1, uu2, fam)
+        
+        if (fam == 2) {
+          cat(sprintf("      --> [静态参数] par(rho): %.4f, kappa(df): %.2f\n", start_rho, start_kappa))
+          cat(sprintf("      --> [动态参数] mu: %.4f, alpha: %.4f, beta: %.4f, kappa(df): %.2f\n", 
+                      best[1], best[2], best[3], best[4]))
+        } else {
+          cat(sprintf("      --> [静态参数] par(rho/theta): %.4f\n", start_rho))
+          cat(sprintf("      --> [动态参数] mu: %.4f, alpha: %.4f, beta: %.4f\n", 
+                      best[1], best[2], best[3]))
+        }
+        cat(sprintf("      --> [模型拟合] 该 Edge 对数似然: %.2f\n", fres$loglik))
+        
+        res <- list(loglik = fres$loglik, h1 = fres$h1, h2 = fres$h2,
+                    params = best, fam = fam, par_seq = fres$par_t)
+      }
+      
+      results[[tree_idx]][[e]] <- res
+      total_ll <- total_ll + res$loglik
+    }
+    
+    # 本层总似然
+    tree_ll <- sum(sapply(results[[tree_idx]], function(x) x$loglik))
+    cat(sprintf("==> Tree %d 结构完成 | 本层累积对数似然: %.2f\n", tree_idx, tree_ll))
+  }
+  
+  return(list(total_loglik = total_ll, edges = results))
+}
+# 辅助函数 %||% (若不存在则创建空列表)
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+
+# ----------------------------- 5. 训练三种模型-------------------------------------------
+cat("===== 训练静态 D-Vine =====\n")
+static_model <- train_dvine(u_train, "static")
+cat(sprintf("静态模型训练完成，总对数似然: %.4f\n", static_model$total_loglik))
+
+cat("\n===== 训练 D-Vine-FIGAS =====\n")
+figas_model <- train_dvine(u_train, "figas")
+cat(sprintf("FIGAS 模型训练完成，总对数似然: %.4f\n", figas_model$total_loglik))
+
+cat("\n===== 训练 D-Vine-GAS(1,1) =====\n")
+gas_model <- train_dvine(u_train, "gas")
+cat(sprintf("GAS 模型训练完成，总对数似然: %.4f\n", gas_model$total_loglik))
+
+# ----- 6. 测试集 OOS 评估 -----------------------------------------
+# 我们需要一个函数，利用训练好的模型参数（静态参数或动态参数）在测试集上计算对数似然
+# 由于上述 train_dvine 返回了每条边的参数和 h 序列，但测试时需要重新过滤（对于动态模型）或直接计算静态似然
+# 这里我们单独实现测试函数，重用已有的 filter_figas / filter_gas 以及静态似然计算
+
+eval_test_dvine <- function(u_test_data, trained_model, model_type) {
+  n <- nrow(u_test_data)
+  total_ll <- 0
+  results_test <- list()
+  
+  for (tree_idx in 1:4) {
+    tree_edges <- dvine_structure[[tree_idx]]
+    n_edges <- length(tree_edges)
+    results_test[[tree_idx]] <- list()
+    
+    for (e in 1:n_edges) {
+      edge <- tree_edges[[e]]
+      v1 <- edge$v1; v2 <- edge$v2; fam <- edge$family
+      
+      if (tree_idx == 1) {
+        uu1 <- u_test_data[, v1]
+        uu2 <- u_test_data[, v2]
+      } else if (tree_idx == 2) {
+        uu1 <- results_test[[1]][[e]]$h1
+        uu2 <- results_test[[1]][[e+1]]$h2
+      } else if (tree_idx == 3) {
+        if (e == 1) {
+          uu1 <- results_test[[2]][[1]]$h1
+          uu2 <- results_test[[2]][[2]]$h2
+        } else if (e == 2) {
+          uu1 <- results_test[[2]][[2]]$h1
+          uu2 <- results_test[[2]][[3]]$h2
+        }
+      } else if (tree_idx == 4) {
+        uu1 <- results_test[[3]][[1]]$h1
+        uu2 <- results_test[[3]][[2]]$h2
+      }
+      
+      if (model_type == "static") {
+        params <- trained_model$edges[[tree_idx]][[e]]$params
+        par_static <- params$par
+        par2_static <- ifelse(fam == 2, params$par2, 0)
+        hvals <- BiCopHfunc(uu1, uu2, family = fam, par = par_static, par2 = par2_static)
+        loglik <- sum(log(pmax(BiCopPDF(uu1, uu2, family = fam, par = par_static, par2 = par2_static), 1e-10)))
+        res <- list(loglik = loglik, h1 = hvals$hfunc1, h2 = hvals$hfunc2)
+      } else if (model_type == "figas") {
+        params <- trained_model$edges[[tree_idx]][[e]]$params
+        fres <- filter_figas(params, uu1, uu2, fam)
+        res <- list(loglik = fres$loglik, h1 = fres$h1, h2 = fres$h2)
+      } else if (model_type == "gas") {
+        params <- trained_model$edges[[tree_idx]][[e]]$params
+        fres <- filter_gas(params, uu1, uu2, fam)
+        res <- list(loglik = fres$loglik, h1 = fres$h1, h2 = fres$h2)
+      }
+      
+      results_test[[tree_idx]][[e]] <- list(h1 = res$h1, h2 = res$h2)
+      total_ll <- total_ll + res$loglik
+    }
+  }
+  return(total_ll)
+}
+
+# 计算测试集 OOS 对数似然
+cat("\n===== 计算测试集 OOS 对数似然 =====\n")
+static_test_ll <- eval_test_dvine(u_test, static_model, "static")
+figas_test_ll  <- eval_test_dvine(u_test, figas_model, "figas")
+gas_test_ll    <- eval_test_dvine(u_test, gas_model, "gas")
+
+cat("\n================ 样本外 (OOS) 结果比较 ================\n")
+cat(sprintf("静态 D-Vine         OOS LogLik: %.4f\n", static_test_ll))
+cat(sprintf("D-Vine + FIGAS      OOS LogLik: %.4f\n", figas_test_ll))
+cat(sprintf("D-Vine + GAS(1,1)   OOS LogLik: %.4f\n", gas_test_ll))
+
+best_idx <- which.max(c(static_test_ll, figas_test_ll, gas_test_ll))
+best_name <- c("静态", "FIGAS", "GAS")[best_idx]
+cat(sprintf("\n最优模型是: %s\n", best_name))
+cat("========================================================\n")
+
