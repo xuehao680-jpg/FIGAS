@@ -443,10 +443,16 @@ def filter_figas(theta, u1, u2, fam_id):
     # --------------------------------------------------------------------
     h1 = np.zeros(T_len)
     h2 = np.zeros(T_len)
+    n_h_fallback = 0
     for t in range(T_len):
         h1[t], h2[t] = _safe_bicop_hfunc(u1[t], u2[t], family=fam_id,
                                            par=par_t[t], par2=kappa)
+        if h1[t] == u1[t] and h2[t] == u2[t]:
+            n_h_fallback += 1
 
+    if n_h_fallback > 0:
+        import warnings
+        warnings.warn(f"FIGAS filter: {n_h_fallback}/{T_len} h-function evaluations fell back to independence copula", RuntimeWarning)
     return dict(
         loglik=float(np.sum(ll_seq)),
         ll_seq=ll_seq,
