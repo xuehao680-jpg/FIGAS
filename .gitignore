@@ -17,3 +17,8 @@ venv/
 # System
 .DS_Store
 Thumbs.db
+
+# Data output files
+data/*.csv
+data/*.pkl
+data/*.png
