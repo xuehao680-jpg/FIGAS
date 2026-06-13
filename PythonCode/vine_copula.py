@@ -169,67 +169,27 @@ def select_vine_structure(u_data):
         print("=== 正在自动构建最优 Vine Copula 结构 (pyvinecopulib) ... ===")
         results = {}
         family_set = [1, 2, 3, 4, 5, 10]
+        pobs_data = pv.to_pseudo_obs(pobs)
 
         for vtype in ["RVine", "CVine", "DVine"]:
             print(f"  --- {vtype} 选择中 ... ---")
-            if vtype == "DVine":
-                # D-Vine with TSP ordering
-                tau_mat = np.zeros((n_cols, n_cols))
-                for i in range(n_cols):
-                    for j in range(n_cols):
-                        if i < j:
-                            t, _ = kendalltau(pobs[:, i], pobs[:, j])
-                            tau_mat[i, j] = t
-                            tau_mat[j, i] = t
-                        elif i == j:
-                            tau_mat[i, j] = 1.0
-                dist_mat = 1.0 - np.abs(tau_mat)
-                try:
-                    import python_tsp.distances as tsp_dist
-                    import python_tsp.heuristics as tsp_heur
-                    dist_sq = ((dist_mat + dist_mat.T) / 2.0).astype(np.float64)
-                    dist_sq[np.diag_indices_from(dist_sq)] = 0.0
-                    perm, _ = tsp_heur.solve_tsp_local_search(
-                        tsp_dist.TSPDistanceMatrix(dist_sq)
-                    )
-                    order = [int(p + 1) for p in perm]
-                    print(f"  D-vine 最优变量顺序: {order}")
-                except ImportError:
-                    order = list(range(1, n_cols + 1))
-                    print(f"  TSP library unavailable; using sequential order: {order}")
-
-                mat, family_arr, theta_arr, nu_arr = pv.D2RVine(order)
-                ctrl = pv.FitControlsVinecop(
-                    family_set=family_set,
-                    selection_criterion="aic"
-                )
-                vc = pv.Vinecop(data=pv.to_pseudo_obs(pobs), controls=ctrl, matrix=mat)
-                results[vtype] = {
-                    "logLik": vc.loglik() if hasattr(vc, 'loglik') else vc.get_loglik(),
-                    "AIC": vc.aic() if hasattr(vc, 'aic') else vc.get_aic(),
-                    "BIC": vc.bic() if hasattr(vc, 'bic') else vc.get_bic(),
-                }
+            ctrl = pv.FitControlsVinecop(
+                family_set=family_set,
+                select_truncation=True,
+                select_threshold=0.05,
+                show_trace=False
+            )
+            if vtype == "CVine":
+                s = pv.CVineStructure(list(range(n_cols)))
+                vc = pv.Vinecop(data=pobs_data, controls=ctrl, structure=s)
+            elif vtype == "DVine":
+                s = pv.DVineStructure(list(range(n_cols)))
+                vc = pv.Vinecop(data=pobs_data, controls=ctrl, structure=s)
             else:
-                structure = getattr(pv, f"{vtype}StructureSelect")
-                result = structure(
-                    data=pobs,
-                    familyset=family_set,
-                    selectioncrit="AIC"
-                )
-                if vtype == "RVine":
-                    results[vtype] = {
-                        "logLik": result.logLik,
-                        "AIC": result.AIC,
-                        "BIC": result.BIC,
-                    }
-                elif vtype == "CVine":
-                    results[vtype] = {
-                        "logLik": result.logLik,
-                        "AIC": result.AIC,
-                        "BIC": result.BIC,
-                    }
-
-        # Build comparison dataframe
+                vc = pv.Vinecop(data=pobs_data, controls=ctrl)
+            ll = vc.get_loglik(); ai = vc.get_aic(); bi = vc.get_bic()
+            results[vtype] = {"logLik": ll, "AIC": ai, "BIC": bi}
+            print(f"    {vtype}: LogLik={ll:.2f}, AIC={ai:.2f}, BIC={bi:.2f}")
         comparison = pd.DataFrame([
             {"Model": "R-vine", "LogLik": results["RVine"]["logLik"],
              "AIC": results["RVine"]["AIC"], "BIC": results["RVine"]["BIC"]},
@@ -238,8 +198,7 @@ def select_vine_structure(u_data):
             {"Model": "D-vine", "LogLik": results["DVine"]["logLik"],
              "AIC": results["DVine"]["AIC"], "BIC": results["DVine"]["BIC"]},
         ])
-
-    except (ImportError, Exception) as e:
+    except Exception as e:
         print(f"pyvinecopulib 不可用或出错 ({e}), 使用简化 D-Vine 结构选择.")
         print("=== 简化 D-Vine 结构选择 ===")
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/xuehao/miniconda3/envs/figas/bin/python3
 """
 Main pipeline: 一带一路沿线国家股市风险溢出分析
 D-Vine-FIGAS Copula 模型
