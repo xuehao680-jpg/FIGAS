@@ -45,6 +45,7 @@ from figas_filter import (
     _safe_bicop_hfunc,
     filter_figas,
     estimate_figas_params,
+    estimate_figas_params_lbfgsb,
 )
 from gas_filter import filter_gas, estimate_gas_params
 
@@ -421,7 +422,7 @@ def train_dvine(u_data, model_type):
                 }
 
             elif model_type == "figas":
-                best_params, fres = estimate_figas_params(
+                best_params, fres = estimate_figas_params_lbfgsb(
                     uu1, uu2, fam, verbose=False
                 )
                 # Re-print with edge context
@@ -753,8 +754,8 @@ if __name__ == "__main__":
     # Test a single edge to avoid long optimization times
     uu1 = u_train_re[:, 0]
     uu2 = u_train_re[:, 1]
-    best_p, fres = estimate_figas_params(uu1, uu2, 14, verbose=True)
-    print(f"  FIGAS edge 1 loglik: {fres['loglik']:.2f}")
+    best_p, fres = estimate_figas_params_lbfgsb(uu1, uu2, 14, verbose=True)
+    print(f"  FIGAS-LBFGSB edge 1 loglik: {fres['loglik']:.2f}")
 
     # ── Test 6: Train GAS (smoke test) ─────────────────────────────────────
     print("\n[Test 6] train_dvine (gas) -- edge 1 only (quick smoke)")

@@ -601,7 +601,10 @@ def _inverse_link(fam_id, par):
 def estimate_figas_params(u1, u2, fam_id, verbose=True):
     """
     Estimate FIGAS parameters via Optuna Bayesian optimization.
-    d is constrained to (0, 0.5) per domain rule.
+
+    Uses static copula MLE for start_mu to narrow the search range,
+    with 500 trials for thorough exploration.
+    d is constrained to (0.001, 0.499) per domain rule.
     """
     import optuna
 
@@ -610,23 +613,27 @@ def estimate_figas_params(u1, u2, fam_id, verbose=True):
     # Static initial estimates
     start_rho, start_kappa = _static_copula_fit(u1a, u2a, fam_id)
     start_mu = _inverse_link(fam_id, start_rho)
+    # Clamp start_mu like GAS does
+    start_mu = max(min(start_mu, 5.0), -5.0)
 
     if verbose:
         suffix = f", kappa={start_kappa:.2f}" if fam_id == 2 else ""
-        print(f"  [FIGAS] family={fam_id}, static_par={start_rho:.4f}{suffix}")
+        print(f"  [FIGAS-Optuna] family={fam_id}, static_par={start_rho:.4f}{suffix}, start_mu={start_mu:.4f}")
+
+    # Narrow search around start_mu (±5 instead of ±20)
+    mu_lo = max(start_mu - 5.0, -20.0)
+    mu_hi = min(start_mu + 5.0, 20.0)
 
     def objective(trial):
-        mu = trial.suggest_float('mu', -20, 20)
+        mu = trial.suggest_float('mu', mu_lo, mu_hi)
         alpha = trial.suggest_float('alpha', 0.001, 0.5)
         beta = trial.suggest_float('beta', 0.001, 0.999)
-        d = trial.suggest_float('d', 0.001, 0.499)  # must be in (0, 0.5)
+        d = trial.suggest_float('d', 0.001, 0.499)
 
-        n_pars = 4
         theta = [mu, alpha, beta, d]
         if fam_id == 2:
             kappa = trial.suggest_float('kappa', 2.1, 50.0)
             theta.append(kappa)
-            n_pars = 5
 
         try:
             tmp = filter_figas(np.array(theta), u1a, u2a, fam_id)
@@ -635,11 +642,11 @@ def estimate_figas_params(u1, u2, fam_id, verbose=True):
         except Exception:
             return float(-1e10)
 
-    n_trials = 80 if fam_id == 2 else 60
+    n_trials = 500 if fam_id == 2 else 500
 
     study = optuna.create_study(direction='maximize')
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=n_trials, n_jobs=-1, show_progress_bar=False)
 
     best_params_list = [study.best_params['mu'], study.best_params['alpha'],
                         study.best_params['beta'], study.best_params['d']]
@@ -650,12 +657,134 @@ def estimate_figas_params(u1, u2, fam_id, verbose=True):
     fres = filter_figas(best, u1a, u2a, fam_id)
 
     if verbose:
-        print(f"    FIGAS best: mu={best[0]:.4f}, a={best[1]:.4f}, "
+        print(f"    FIGAS-Optuna best: mu={best[0]:.4f}, a={best[1]:.4f}, "
               f"b={best[2]:.4f}, d={best[3]:.4f}" +
               (f", k={best[4]:.2f}" if fam_id == 2 else ""))
-        print(f"    FIGAS loglik: {fres['loglik']:.2f} (n={len(u1a)})")
+        print(f"    FIGAS-Optuna loglik: {fres['loglik']:.2f} (n={len(u1a)})")
 
     return best, fres
+
+
+# ============================================================
+#  6b.  FIGAS estimation — L-BFGS-B  (same style as GAS)
+# ============================================================
+
+def estimate_figas_params_lbfgsb(u1, u2, fam_id, verbose=True):
+    """
+    Estimate FIGAS parameters via L-BFGS-B (matching GAS estimation style).
+
+    Uses static copula MLE for start_mu, then gradient-based L-BFGS-B
+    with multi-start to avoid local optima.
+    """
+    rng = np.random.RandomState(SEED)
+
+    u1a = np.asarray(u1, dtype=float).ravel()
+    u2a = np.asarray(u2, dtype=float).ravel()
+
+    # ── Step 1: Static copula estimation ────────────────────────────────
+    static_par, static_par2 = _static_copula_fit(u1a, u2a, fam_id)
+    if verbose:
+        suffix = f", kappa={static_par2:.2f}" if fam_id == 2 else ""
+        print(f"  [FIGAS-LBFGSB] family={fam_id}, static_par={static_par:.4f}{suffix}")
+
+    # ── Step 2: Inverse-link to get start_mu ────────────────────────────
+    start_mu = _inverse_link(fam_id, static_par)
+    start_mu = max(min(start_mu, 5.0), -5.0)
+
+    # ── Step 3: Initial parameters and bounds ───────────────────────────
+    # [mu, alpha, beta, d]  (+ kappa for t)
+    init_par = [start_mu, 0.05, 0.5, 0.15]
+    lower = [
+        max(start_mu - 5.0, FIGAS_BOUNDS["mu"][0]),
+        FIGAS_BOUNDS["alpha"][0],
+        FIGAS_BOUNDS["beta"][0],
+        FIGAS_BOUNDS["d"][0],
+    ]
+    upper = [
+        min(start_mu + 5.0, FIGAS_BOUNDS["mu"][1]),
+        FIGAS_BOUNDS["alpha"][1],
+        FIGAS_BOUNDS["beta"][1],
+        FIGAS_BOUNDS["d"][1],
+    ]
+
+    if fam_id == 2:
+        init_kappa = max(3.0, static_par2)
+        init_par.append(init_kappa)
+        lower.append(FIGAS_BOUNDS["kappa"][0])
+        upper.append(FIGAS_BOUNDS["kappa"][1])
+
+    init_par = np.array(init_par, dtype=float)
+    lower = np.array(lower, dtype=float)
+    upper = np.array(upper, dtype=float)
+
+    # ── Step 4: Multi-start L-BFGS-B ────────────────────────────────────
+    def _objective(theta_vec):
+        try:
+            tmp = filter_figas(theta_vec, u1a, u2a, fam_id)
+            ll = tmp["loglik"]
+            if not np.isfinite(ll):
+                return 1e10
+            return -ll
+        except Exception:
+            return 1e10
+
+    if verbose:
+        labels = ["mu", "alpha", "beta", "d"]
+        if fam_id == 2:
+            labels.append("kappa")
+        init_str = ", ".join(
+            f"{labels[i]}={init_par[i]:.4f}" for i in range(len(init_par))
+        )
+        print(f"    Initial params: {init_str}")
+        print(f"    Optimising via L-BFGS-B (multi-start) ...")
+
+    best_nll = np.inf
+    best_x = init_par.copy()
+
+    n_restarts = 3
+    for restart in range(n_restarts):
+        if restart == 0:
+            x_init = init_par.copy()
+        else:
+            x_init = init_par.copy()
+            # perturb
+            x_init[0] += rng.normal(0, 0.5)          # mu
+            x_init[1] *= np.exp(rng.normal(0, 0.3))  # alpha
+            x_init[2] += rng.normal(0, 0.1)          # beta
+            x_init[3] += rng.uniform(-0.1, 0.1)      # d
+            if fam_id == 2:
+                x_init[4] += rng.normal(0, 3.0)      # kappa
+            # clip to bounds
+            x_init = np.clip(x_init, lower + 1e-8, upper - 1e-8)
+
+        try:
+            opt_result = minimize(
+                _objective,
+                x0=x_init,
+                method="L-BFGS-B",
+                bounds=list(zip(lower, upper)),
+                options={"maxiter": 300, "maxfun": 500, "ftol": 1e-8},
+            )
+            if opt_result.fun < best_nll:
+                best_nll = opt_result.fun
+                best_x = opt_result.x
+        except Exception:
+            continue
+
+    # ── Step 5: Final filtered result ───────────────────────────────────
+    fres = filter_figas(best_x, u1a, u2a, fam_id)
+
+    if verbose:
+        labels = ["mu", "alpha", "beta", "d"]
+        if fam_id == 2:
+            labels.append("kappa")
+        best_str = ", ".join(
+            f"{labels[i]}={best_x[i]:.4f}" for i in range(len(best_x))
+        )
+        print(f"    Best params:  {best_str}")
+        print(f"    FIGAS-LBFGSB loglik: {fres['loglik']:.2f}  (n={len(u1a)})")
+
+    return best_x, fres
 
 
 # ============================================================================
