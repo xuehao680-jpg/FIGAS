@@ -78,3 +78,6 @@ def ensure_dirs():
     """Create output directories if they don't exist."""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── PIT transformation method ──────────────────────────────────────
+PIT_METHOD = "parametric"  # "parametric" (Student-t CDF) or "ecdf" (empirical CDF)
