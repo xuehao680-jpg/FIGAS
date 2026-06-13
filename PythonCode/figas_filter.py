@@ -582,7 +582,7 @@ def _inverse_link(fam_id, par):
     elif fam_id == 23:
         return log(max(-float(par) - 1e-4, 1e-10))
     elif fam_id == 3:
-        return log(max(float(par) + 1e-4, 1e-10))
+        return log(max(float(par) - 1e-4, 1e-10))
     else:
         return log(max(float(par) - 1.0001, 1e-10))
 
