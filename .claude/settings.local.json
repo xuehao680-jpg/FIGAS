@@ -1,7 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(openspec instructions *)"
+      "Bash(openspec instructions *)",
+      "Bash(/mnt/d/zcc/venv/bin/pip install *)",
+      "Bash(python3 *)",
+      "Bash(pip list *)",
+      "Bash(/tmp/claude-1000/-mnt-d-zcc/4dc73170-5df3-4ba1-a03f-6bf0f77d913a/tasks/b1kxt5y10.output *)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'feat: Complete D-Vine-FIGAS Copula Python refactoring with Optuna Bayesian optimization *)",
+      "Bash(git push *)",
+      "Bash(git commit -m 'fix: correct inverse link function for Clayton Copula \\(family 3\\) *)",
+      "Bash(git commit -m 'fix: add h-function fallback warning + semiparametric PIT option *)",
+      "Bash(git commit -m 'fix: h-function fallback warning + PIT config option *)",
+      "Bash(conda create *)",
+      "Bash(/usr/bin/python3.12 -m venv /mnt/d/zcc/.venv --clear)",
+      "Bash(git commit -m 'feat: full pyvinecopulib RVineStructureSelect integration; use conda figas env *)"
     ]
   }
 }

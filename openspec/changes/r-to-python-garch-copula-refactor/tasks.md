@@ -18,11 +18,11 @@
 ## 3. Marginal GARCH Models (marginal_models.py)
 
 - [ ] 3.1 Define specs dict: {asset: {armaOrder, garchOrder, dist}} — hardcode from R code results
-- [ ] 3.2 Implement `fit_gjr_garch()`: fit GJR-GARCH(1,1)+std via arch library, return fitted model
+- [x] 3.2 Implement `fit_gjr_garch()`: fit ARMA(p,q)-GJR-GARCH(1,1)+std via custom joint MLE (L-BFGS-B multi-start), return ARMAGARCHResult. **Changed from arch library (no MA support) to custom scipy.optimize MLE**
 - [ ] 3.3 Implement `extract_std_residuals()`: extract standardized residuals from fitted model
 - [ ] 3.4 Implement `pit_transform()`: PIT using scipy.stats.t.cdf with estimated shape parameter
 - [ ] 3.5 Implement `residual_diagnostics()`: Ljung-Box (lags 5,10,15) and ARCH-LM (lags 5,10) on standardized residuals
-- [ ] 3.6 Implement `filter_test_set()`: ugarchfilter equivalent — fixed.pars from training on test set
+- [x] 3.6 Implement `filter_test_set()`: ugarchfilter equivalent — `_filter_single_arma_gjr_garch_t()` with fixed parameters from training on test set
 - [ ] 3.7 Implement `save_marginal_outputs()`: save u_train.csv, u_test.csv, fitted_models.pkl
 
 ## 4. Vine Copula Selection (vine_copula.py)

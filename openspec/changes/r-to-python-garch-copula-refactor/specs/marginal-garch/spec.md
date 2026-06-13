@@ -1,17 +1,19 @@
 ## ADDED Requirements
 
-### Requirement: GJR-GARCH with Student-t distribution
+### Requirement: ARMA-GJR-GARCH with Student-t distribution
 
-The system SHALL fit a GJR-GARCH(1,1) model with Student-t distributed innovations to each asset's return series using maximum likelihood estimation.
+The system SHALL fit an ARMA(p,q)-GJR-GARCH(1,1) model with Student-t distributed innovations to each asset's return series using custom joint maximum likelihood estimation via scipy L-BFGS-B.
 
-#### Scenario: Fit GJR-GARCH on training set
+Note: Python's `arch` library (v8.0.0) does NOT support MA terms in the mean equation. Custom MLE was necessary to fully replicate R's `rugarch` ARMA-GJR-GARCH specification.
+
+#### Scenario: Fit ARMA-GJR-GARCH on training set
 - **WHEN** training set returns (1944 observations) are provided for each of the 5 assets
-- **THEN** the system estimates all GJR-GARCH parameters (mu, omega, alpha1, beta1, gamma1, shape) via MLE
+- **THEN** the system estimates all parameters (mu, ar1..p, ma1..q, omega, alpha1, gamma1, beta1, nu) via joint MLE with multi-start L-BFGS-B
 - **AND** parameter estimates are printed with 6 decimal precision
 
 #### Scenario: Extract standardized residuals
-- **WHEN** GJR-GARCH model is fitted
-- **THEN** standardized residuals z_t = (r_t - mu) / sigma_t are extracted
+- **WHEN** ARMA-GJR-GARCH model is fitted
+- **THEN** standardized residuals z_t = epsilon_t / sigma_t are extracted (where epsilon_t accounts for ARMA mean dynamics)
 - **AND** residuals pass Ljung-Box test at lags 5, 10, 15 (p > 0.05)
 - **AND** squared residuals pass ARCH-LM test at lags 5, 10 (p > 0.05)
 
@@ -27,13 +29,13 @@ The system SHALL transform standardized residuals to uniform (0,1) observations 
 
 ### Requirement: Test set filtering with fixed parameters
 
-The system SHALL filter the test set (486 observations) through the fitted GJR-GARCH model using fixed parameters from training, without re-estimation.
+The system SHALL filter the test set (486 observations) through the fitted ARMA-GJR-GARCH model using fixed parameters from training, without re-estimation.
 
 #### Scenario: Filter test set
-- **WHEN** fitted GJR-GARCH model and test set returns are provided
-- **THEN** conditional volatility sigma_t is computed using fixed parameters
+- **WHEN** fitted ARMA-GJR-GARCH model and test set returns are provided
+- **THEN** conditional volatility sigma_t is computed using fixed parameters via `_filter_single_arma_gjr_garch_t()`
 - **AND** standardized residuals for test set are extracted
-- **AND** PIT transformation is applied using training set shape parameter
+- **AND** PIT transformation is applied using training set shape parameter nu
 
 ### Requirement: Save marginal model outputs
 

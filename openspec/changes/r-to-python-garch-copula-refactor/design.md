@@ -26,9 +26,10 @@
 ## Decisions
 
 ### 1. 边缘 GARCH 建模：`arch` 库 vs 手写
-- **选择**: 使用 `arch` 库 (`arch.univariate.GARCH`)
-- **理由**: `arch` 库原生支持 GJR-GARCH + Student-t，并提供 `fixed_pars` 用于检验集过滤，与 R 的 `rugarch` 功能完全对齐
-- **备选**: 手写 GJR-GARCH 需实现极大似然优化和约束条件，开发量过大且容易出错
+- **最终选择**: 手写 ARMA(p,q)-GJR-GARCH(1,1)-t 联合 MLE（`scipy.optimize.minimize` + L-BFGS-B）
+- **变更原因**: Python `arch` 库 v8.0.0 **不支持** MA 项——其 `mean` 参数仅支持 `Constant/Zero/AR/ARX/HAR/HARX/LS`，无 ARMA。原 R 代码使用 `rugarch` 的 `armaOrder=c(p,q)` 进行联合 MLE，`arch` 库的 AR-only 设定导致均值方程设定错误（hushen300 的 MA(2)、ydlMIB 的 MA(2) 等被直接丢弃），残差 LB/ARCH 检验大量不通过
+- **实现**: 自定义 `_compute_arma_gjr_garch()` 递归计算 ARMA 残差 + GJR-GARCH 波动率，`_arma_gjr_garch_t_nll()` 计算 Student-t 对数似然，多起点 L-BFGS-B 优化，`ARMAGARCHResult` 封装估计结果并保持与旧 `ARCHModelResult` 接口兼容
+- **优势**: 完全复现 R `rugarch` 的参数化，MA 项参与联合估计
 
 ### 2. Vine Copula: `pyvinecopula` vs 手写
 - **选择**: 混合策略 — `pyvinecopula` 用于静态结构和参数估计，手写动态过滤函数（FIGAS/GAS）
