@@ -175,8 +175,8 @@ def select_vine_structure(u_data):
             print(f"  --- {vtype} 选择中 ... ---")
             ctrl = pv.FitControlsVinecop(
                 family_set=family_set,
-                select_truncation=True,
-                select_threshold=0.05,
+                select_trunc_lvl=True,
+                select_threshold=True, threshold=0.05,
                 show_trace=False
             )
             if vtype == "CVine":
