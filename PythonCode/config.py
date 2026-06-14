@@ -80,4 +80,4 @@ def ensure_dirs():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── PIT transformation method ──────────────────────────────────────
-PIT_METHOD = "ecdf"  # "ecdf" = empirical CDF (preserves long memory for FIGAS) | "parametric" = Student-t CDF
+PIT_METHOD = "ecdf"  # PRIMARY: "ecdf" = empirical CDF (preserves long memory for FIGAS) | "parametric" = Student-t CDF via GARCH

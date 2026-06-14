@@ -59,15 +59,38 @@
 - **选择**: `pathlib.Path` 替代硬编码字符串
 - **理由**: 跨平台兼容（Linux/WSL/Windows），不再需要类似 "C:/Users/12936/Desktop/" 的硬编码
 
+### 7. PIT 方法：ECDF vs 参数化 GARCH-t
+- **选择**: 支持双模式，默认 ECDF（经验 CDF）
+- **ECDF 模式**: 直接对原始收益率做 rank-based pseudo-observations，保留波动聚集性和长记忆结构，让 FIGAS 在 Copula 层面充分捕获
+- **参数化模式**: 传统 GJR-GARCH-t → 标准化残差 → Student-t CDF，GARCH 滤波后 PIT 序列近似白噪声
+- **结论**: 两种模式下 FIGAS Train LL 均超越 GAS。ECDF 下 FIGAS 的 d 参数全部非零（0.1-0.25），参数化下 d 约半数非零（GARCH 滤波吸收了部分长记忆）
+
+### 8. FIGAS 递归方程修复
+- **问题**: 原单方程递归 `y[t+1] = beta*y[t] + alpha*s[t] - sum(psi_j * y[t+1-j])` 缺失 (1-βL)(1-L)^d 展开的交叉项 β*φ_j，导致 d>0.005 即数值爆炸
+- **修复**: 两步法 — Step A: `X_{t+1} = β*X_t + α*s_t` (AR(1) 传播分数阶差分过程), Step B: `y_{t+1} = X_{t+1} - Σ φ_k * y_{t+1-k}` (反解)
+- **效果**: d 在 [0, 0.49] 全区间稳定，模拟数据 d=0.3 时 FIGAS > GAS
+
+## 实验结果 (v2 — FIGAS 修复 + 双 PIT 模式)
+
+### ECDF 模式 (n=1944, 10 edges)
+| 模型 | Train LL | OOS LL |
+|------|----------|--------|
+| Static D-Vine | 763.98 | 164.63 |
+| D-Vine + GAS | 797.78 | 174.29 |
+| **D-Vine + FIGAS** | **799.81** | 171.01 |
+
+### 参数化 GARCH-t PIT 模式
+| 模型 | Train LL | OOS LL |
+|------|----------|--------|
+| Static D-Vine | 816.22 | 198.50 |
+| D-Vine + GAS | 828.93 | 203.47 |
+| **D-Vine + FIGAS** | **833.53** | 199.92 |
+
+FIGAS 在两种 PIT 模式下 Train LL 均超越 GAS (+2 ~ +5)。OOS 的微小差距来自额外 10 个 d 参数的过拟合效应。
+
 ## Risks / Trade-offs
 
 - **[精度差异]** R 和 Python 的浮点运算实现不同，FIGAS 递归过程中细小数值差异可能逐期累积 → 在核心函数中设置与 R 一致的截断阈值（如 `max(min(x, 10), -10)`），关键输出用 `np.allclose` 验证
 - **[pyvinecopula 不可用]** 如果 `pyvinecopula` 在 WSL 环境下编译失败 → 回退方案：用 `scipy.stats` + 手写 BiCopEst/BiCopPDF/BiCopHfunc
-- **[FIGAS 收敛问题]** 分数阶参数 d 在边界（0.05, 0.49）处可能导致似然面平坦 → 使用多重初始值（R 代码中的 `runif` 随机初始化）并选择最优收敛结果
+- **[FIGAS 收敛问题]** ~~分数阶参数 d 在边界（0.05, 0.49）处可能导致似然面平坦~~ **已解决** — 两步法递归修复后 d 全区间稳定
 - **[性能]** D-Vine Tree 的 FIGAS 训练涉及 10 条边 × 每边参数优化，总计算量约是参考代码的 10 倍 → 预期训练时间 ~5-10 分钟（R 版本类似），可在后续用 `numba` 加速
-
-## Open Questions
-
-- `pyvinecopula` 在 WSL Python 3.10 环境下能否直接 `pip install`？（需在实际环境验证）
-- 是否需要保留 R 代码中的 CoVaR/风险溢出部分？（当前标记为 Non-Goal，待确认）
-- FIGAS 的参数 d 是否需要与 alpha/beta 联合优化，还是可以固定为某个经验值？
