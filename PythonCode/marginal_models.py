@@ -497,17 +497,34 @@ def extract_std_residuals(fit_dict):
 # ============================================================
 #  3.  pit_transform
 # ============================================================
-def pit_transform(z_dict, shape_dict):
+def pit_transform(z_dict, shape_dict, returns_df=None):
     """
     Probability Integral Transform:  z ~ t(nu)  →  u ~ Uniform(0,1).
 
     Uses scipy.stats.t.cdf with the asset-specific degrees of freedom
     obtained from the GARCH fit.
 
+    When PIT_METHOD == "ecdf", uses empirical CDF (rank-based pseudo-observations)
+    on RAW returns *instead* of the standardized residuals — this preserves
+    volatility clustering and long-memory structure for downstream FIGAS Copula
+    modeling.  The `z_dict` / `shape_dict` arguments are ignored in ECDF mode.
+
     Returns
     -------
     u_dict : dict  {asset: np.ndarray}
     """
+    if PIT_METHOD == "ecdf":
+        from scipy.stats import rankdata
+        u_dict = {}
+        # returns_df must be provided in ECDF mode — raw FINANCIAL returns
+        if returns_df is None:
+            raise ValueError("ECDF mode requires `returns_df` (raw returns).")
+        for asset in returns_df.columns:
+            r_train = returns_df[asset].values
+            u_dict[asset] = rankdata(r_train) / (len(r_train) + 1)
+        return u_dict
+
+    # parametric mode (default)
     u_dict = {}
     for asset in z_dict:
         z = z_dict[asset]
@@ -591,7 +608,8 @@ def pit_uniformity_check(u_dict, show_plots=True):
 # ============================================================
 #  6.  filter_test_set
 # ============================================================
-def filter_test_set(fit_dict, test_returns, specs, shape_dict):
+def filter_test_set(fit_dict, test_returns, specs, shape_dict,
+                    returns_train_df=None):
     """
     Filter the test set using parameters estimated on the training set
     (NO re-estimation).  Equivalent to ugarchfilter in rugarch.
@@ -601,6 +619,15 @@ def filter_test_set(fit_dict, test_returns, specs, shape_dict):
       2. Compute residuals and conditional volatilities on test data
          using fixed parameters via _filter_single_arma_gjr_garch_t.
       3. Compute standardised residuals and PIT-transform them.
+
+    In ECDF mode (PIT_METHOD == "ecdf"), the ARMA-GJR-GARCH filter step
+    is still run for residual extraction, but PIT uses training ECDF
+    on *raw returns*.
+
+    Parameters
+    ----------
+    returns_train_df : pd.DataFrame or None
+        Required in ECDF mode — the training-set raw returns.
 
     Returns
     -------
@@ -634,9 +661,16 @@ def filter_test_set(fit_dict, test_returns, specs, shape_dict):
         z_test = np.where(np.isfinite(z_test), z_test, 0.0)
         z_test_dict[asset] = z_test
 
-        # PIT using the *training* shape parameter
-        nu = shape_dict[asset]
-        u_test = stats.t.cdf(z_test, df=nu)
+        # PIT  →  mode-dependent
+        if PIT_METHOD == "ecdf":
+            # Use training ECDF: count how many training obs are ≤ each test obs
+            r_train = returns_train_df[asset].values
+            r_test_vals = test_returns[asset].values
+            n_train = len(r_train)
+            u_test = np.searchsorted(np.sort(r_train), r_test_vals) / (n_train + 1)
+        else:
+            nu = shape_dict[asset]
+            u_test = stats.t.cdf(z_test, df=nu)
         u_test_dict[asset] = u_test
 
         test_filter_results[asset] = filter_result

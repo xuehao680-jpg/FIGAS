@@ -293,7 +293,9 @@ def filter_figas(theta, u1, u2, fam_id):
         1. Map unconstrained g_t to constrained copula parameter par_t via link.
         2. Evaluate log-likelihood (with PDF floor safety).
         3. Compute score (analytical for t-Copula, finite-difference otherwise).
-        4. Update: y_{t+1} = beta*y_t + alpha*s_t - sum_{j=1}^{min(100,t)} psi_j * y_{t+1-j}
+        4. Two-step recursion for (1-βL)(1-L)^d y_t = α s_{t-1}:
+           a. X_{t+1} = β X_t + α s_t               (AR(1) on fractionally differenced y)
+           b. y_{t+1} = X_{t+1} - Σ φ_k y_{t+1-k}   (inverse fractional difference)
         5. Next unconstrained value: g_{t+1} = mu + y_{t+1}
 
     Parameters
@@ -319,15 +321,15 @@ def filter_figas(theta, u1, u2, fam_id):
     ll_seq = np.zeros(T_len)
     scores = np.zeros(T_len)
 
-    # ── Precompute fractional-difference weights ──────────────────────
-    psi = np.zeros(T_len)
-    psi[0] = -d
-    if T_len > 1:
-        for j in range(2, T_len + 1):
-            psi[j - 1] = psi[j - 2] * (j - 1 - d) / j
+    # ── Precompute standard fractional-difference weights (1-L)^d = Σ φ_k L^k ──
+    phi = np.empty(max(100, T_len))
+    phi[0] = 1.0
+    for k in range(1, len(phi)):
+        phi[k] = phi[k - 1] * (k - 1 - d) / k
 
     y[0] = 0.0
     g_t[0] = mu
+    X = 0.0  # fractionally differenced process: X_t = (1-L)^d y_t
 
     for t in range(T_len):
         # -------------------------------------------------------------
@@ -420,16 +422,26 @@ def filter_figas(theta, u1, u2, fam_id):
         scores[t] = max(min(scores[t], SCORE_CLAMP), -SCORE_CLAMP)
 
         # ----------------------------------------------------------------
-        # 4. FIGAS recursion update for next period
+        # 4. FIGAS two-step recursion for (1-βL)(1-L)^d y_t = α s_{t-1}
+        #
+        #    Step A: X_{t+1} = β X_t + α s_t
+        #            Propagate the fractionally differenced process as AR(1).
+        #            Since |β| < 1, X is always stationary and bounded
+        #            by the clamped scores.
+        #
+        #    Step B: y_{t+1} = X_{t+1} - Σ_{k=1}^L φ_k y_{t+1-k}
+        #            Recover the original process by subtracting the
+        #            weighted fractional-difference history.
+        #            This is the inverse of (1-L)^d.
         # ----------------------------------------------------------------
         if t < T_len - 1:
-            sum_psi_y = 0.0
-            L = 100
-            if t >= 0:
-                max_j = min(L, t + 1)  # number of past y values available
-                for j in range(1, max_j + 1):
-                    sum_psi_y += psi[j - 1] * y[t + 1 - j]
-            y[t + 1] = beta * y[t] + alpha * scores[t] - sum_psi_y
+            X = beta * X + alpha * scores[t]
+
+            sum_phi_y = 0.0
+            max_k = min(100, t + 1)  # available lags of y history
+            for k in range(1, max_k + 1):
+                sum_phi_y += phi[k] * y[t + 1 - k]
+            y[t + 1] = X - sum_phi_y
 
             # NA firewall: reset y to 0 if invalid
             if not np.isfinite(y[t + 1]):
@@ -671,34 +683,31 @@ def estimate_figas_params(u1, u2, fam_id, verbose=True):
 
 def estimate_figas_params_lbfgsb(u1, u2, fam_id, verbose=True):
     """
-    Estimate FIGAS parameters via L-BFGS-B (matching GAS estimation style).
+    Estimate FIGAS parameters via multi-start L-BFGS-B.
 
-    Uses static copula MLE for start_mu, then gradient-based L-BFGS-B
-    with multi-start to avoid local optima.
+    With the corrected two-step recursion (stable for all d in [0, 0.49]),
+    we can optimise directly without GAS warm-start.
     """
     rng = np.random.RandomState(SEED)
 
     u1a = np.asarray(u1, dtype=float).ravel()
     u2a = np.asarray(u2, dtype=float).ravel()
 
-    # ── Step 1: Static copula estimation ────────────────────────────────
+    # ── Static copula for start_mu ───────────────────────────────────────
     static_par, static_par2 = _static_copula_fit(u1a, u2a, fam_id)
     if verbose:
         suffix = f", kappa={static_par2:.2f}" if fam_id == 2 else ""
-        print(f"  [FIGAS-LBFGSB] family={fam_id}, static_par={static_par:.4f}{suffix}")
+        print(f"  [FIGAS] family={fam_id}, static_par={static_par:.4f}{suffix}")
 
-    # ── Step 2: Inverse-link to get start_mu ────────────────────────────
     start_mu = _inverse_link(fam_id, static_par)
     start_mu = max(min(start_mu, 5.0), -5.0)
 
-    # ── Step 3: Initial parameters and bounds ───────────────────────────
-    # [mu, alpha, beta, d]  (+ kappa for t)
-    init_par = [start_mu, 0.05, 0.5, 0.15]
+    # ── Bounds (d ≥ 0, now stable!) ─────────────────────────────────────
     lower = [
         max(start_mu - 5.0, FIGAS_BOUNDS["mu"][0]),
         FIGAS_BOUNDS["alpha"][0],
         FIGAS_BOUNDS["beta"][0],
-        FIGAS_BOUNDS["d"][0],
+        0.0,  # d can be exactly zero
     ]
     upper = [
         min(start_mu + 5.0, FIGAS_BOUNDS["mu"][1]),
@@ -706,21 +715,284 @@ def estimate_figas_params_lbfgsb(u1, u2, fam_id, verbose=True):
         FIGAS_BOUNDS["beta"][1],
         FIGAS_BOUNDS["d"][1],
     ]
-
+    init_par = [start_mu, 0.05, 0.5, 0.2]
     if fam_id == 2:
         init_kappa = max(3.0, static_par2)
         init_par.append(init_kappa)
         lower.append(FIGAS_BOUNDS["kappa"][0])
         upper.append(FIGAS_BOUNDS["kappa"][1])
-
     init_par = np.array(init_par, dtype=float)
     lower = np.array(lower, dtype=float)
     upper = np.array(upper, dtype=float)
 
-    # ── Step 4: Multi-start L-BFGS-B ────────────────────────────────────
+    # ── Objective ────────────────────────────────────────────────────────
     def _objective(theta_vec):
         try:
             tmp = filter_figas(theta_vec, u1a, u2a, fam_id)
+            ll = tmp["loglik"]
+            return -ll if np.isfinite(ll) else 1e10
+        except Exception:
+            return 1e10
+
+    if verbose:
+        labels = ["mu", "alpha", "beta", "d"]
+        if fam_id == 2: labels.append("kappa")
+        print(f"    Init: {', '.join(f'{labels[i]}={init_par[i]:.4f}' for i in range(len(init_par)))}")
+
+    # ── Multi-start L-BFGS-B ─────────────────────────────────────────────
+    best_nll = np.inf
+    best_x = init_par.copy()
+
+    for restart in range(5):
+        if restart == 0:
+            xp = init_par.copy()
+        else:
+            xp = init_par.copy()
+            xp[0] += rng.normal(0, 0.5)
+            xp[1] *= np.exp(rng.normal(0, 0.3))
+            xp[2] += rng.normal(0, 0.1)
+            xp[3] += rng.uniform(-0.1, 0.1)
+            if fam_id == 2: xp[4] += rng.normal(0, 3.0)
+            xp = np.clip(xp, lower + 1e-8, upper - 1e-8)
+        try:
+            res = minimize(_objective, x0=xp, method="L-BFGS-B",
+                           bounds=list(zip(lower, upper)),
+                           options={"maxiter": 500, "maxfun": 800, "ftol": 1e-10})
+            if res.fun < best_nll:
+                best_nll = res.fun
+                best_x = res.x
+        except Exception:
+            continue
+
+    fres = filter_figas(best_x, u1a, u2a, fam_id)
+    if verbose:
+        labels = ["mu", "alpha", "beta", "d"]
+        if fam_id == 2: labels.append("kappa")
+        print(f"    Best: {', '.join(f'{labels[i]}={best_x[i]:.4f}' for i in range(len(best_x)))}")
+        print(f"    FIGAS loglik: {fres['loglik']:.2f}  (n={len(u1a)})")
+
+    return best_x, fres
+
+
+# ============================================================================
+# 7. FIGAS(1,d,0) model -- beta forced to 0
+# ============================================================================
+
+def filter_figas_d0(theta, u1, u2, fam_id):
+    """
+    FIGAS(1,d,0) filter for time-varying Copula parameters.
+
+    This is a restricted variant of the FIGAS(1,d,1) model where the
+    autoregressive term (beta) is forced to zero.  The recursion is:
+
+        y_{t+1} = alpha * s_t - sum_{j=1}^{min(100,t+1)} psi_{j-1} * y_{t+1-j}
+
+    where psi_0 = -d, psi_{k+1} = psi_k * (k - d) / (k + 1).
+
+    The fractional differencing alone captures all persistence.  This avoids
+    the numerical explosion that can occur in the full FIGAS(1,d,1) recursion
+    when d and beta interact.
+
+    Parameters
+    ----------
+    theta : np.ndarray
+        [mu, alpha, d] for non-t families, or [mu, alpha, d, kappa] for t.
+    u1, u2 : np.ndarray (1D)
+        Uniform pseudo-observations.
+    fam_id : int
+        Copula family: 2=t, 3=Clayton, 14=Survival Gumbel, 23=Clayton 90-rotated.
+
+    Returns
+    -------
+    dict with keys: loglik, ll_seq, par_t, h1, h2, y
+    """
+    mu, alpha, d = float(theta[0]), float(theta[1]), float(theta[2])
+    kappa = float(theta[3]) if (fam_id == 2 and len(theta) >= 4) else 0.0
+
+    T_len = len(u1)
+    y = np.zeros(T_len)
+    g_t = np.zeros(T_len)
+    par_t = np.zeros(T_len)
+    ll_seq = np.zeros(T_len)
+    scores = np.zeros(T_len)
+
+    # ── Precompute fractional-difference weights ──────────────────────────
+    psi = np.zeros(T_len)
+    psi[0] = -d
+    if T_len > 1:
+        for j in range(2, T_len + 1):
+            psi[j - 1] = psi[j - 2] * (j - 1 - d) / j
+
+    y[0] = 0.0
+    g_t[0] = mu
+
+    for t in range(T_len):
+        # -------------------------------------------------------------
+        # 1. Link function (unconstrained g_t -> constrained copula par)
+        # -------------------------------------------------------------
+        g_safe = max(min(g_t[t], 30.0), -30.0)
+        if fam_id == 2:
+            par_t[t] = (exp(g_safe) - 1.0) / (exp(g_safe) + 1.0)
+            par_t[t] = max(min(par_t[t], 0.98), -0.98)
+        elif fam_id == 14:
+            par_t[t] = exp(g_safe) + 1.0001
+            par_t[t] = max(min(par_t[t], 30.0), 1.0001)
+        elif fam_id == 23:
+            par_t[t] = -exp(g_safe) - 1e-4
+            par_t[t] = max(min(par_t[t], -1e-4), -30.0)
+        elif fam_id == 3:
+            par_t[t] = exp(g_safe) + 1e-4
+            par_t[t] = max(min(par_t[t], 30.0), 1e-4)
+        else:
+            par_t[t] = exp(g_safe) + 1.0001
+            par_t[t] = max(min(par_t[t], 30.0), 1.0001)
+
+        # ----------------------------------------------------------------
+        # 2. Log-likelihood
+        # ----------------------------------------------------------------
+        try:
+            pdf_val = _bicop_pdf(u1[t], u2[t], family=fam_id, par=par_t[t], par2=kappa)
+        except Exception:
+            pdf_val = PDF_FLOOR
+
+        if not np.isfinite(pdf_val) or pdf_val <= 0:
+            pdf_val = PDF_FLOOR
+        ll_seq[t] = log(pdf_val)
+
+        # ----------------------------------------------------------------
+        # 3. Compute scaled score
+        # ----------------------------------------------------------------
+        if fam_id == 2:
+            try:
+                x1 = t_dist.ppf(max(min(u1[t], 0.999999), 1e-9), df=kappa)
+                x2 = t_dist.ppf(max(min(u2[t], 0.999999), 1e-9), df=kappa)
+                mt = (x1 * x1 + x2 * x2 - 2.0 * par_t[t] * x1 * x2) / (1.0 - par_t[t] * par_t[t])
+                pit = (kappa + 2.0) / (kappa + mt)
+                g_s = max(min(g_t[t], 30.0), -30.0)
+                dot_rho = 2.0 * exp(g_s) / (exp(g_s) + 1.0) ** 2
+                denom_nabla = (1.0 - par_t[t] * par_t[t]) ** 2
+                nabla = (dot_rho / denom_nabla) * (
+                    (1.0 + par_t[t] * par_t[t]) * (pit * x1 * x2 - par_t[t])
+                    - par_t[t] * (pit * x1 * x1 + pit * x2 * x2 - 2.0)
+                )
+                Info = (dot_rho * dot_rho / denom_nabla) * (
+                    1.0 + par_t[t] * par_t[t]
+                    - 2.0 * par_t[t] * par_t[t] / (kappa + 2.0)
+                ) * ((kappa + 2.0) / (kappa + 4.0))
+                scores[t] = nabla / sqrt(max(float(Info), 1e-12))
+            except Exception:
+                scores[t] = 0.0
+        else:
+            def _eval_logpdf(g):
+                if not np.isfinite(g):
+                    return log(PDF_FLOOR)
+                g_s = max(min(g, 30.0), -30.0)
+                if fam_id == 14:
+                    tp = max(min(exp(g_s) + 1.0001, 30.0), 1.0001)
+                elif fam_id == 23:
+                    tp = max(min(-exp(g_s) - 1e-4, -1e-4), -30.0)
+                elif fam_id == 3:
+                    tp = max(min(exp(g_s) + 1e-4, 30.0), 1e-4)
+                else:
+                    tp = max(min(exp(g_s) + 1.0001, 30.0), 1.0001)
+                try:
+                    v = _bicop_pdf(u1[t], u2[t], family=fam_id, par=tp, par2=kappa)
+                except Exception:
+                    v = PDF_FLOOR
+                if not np.isfinite(v) or v <= 0:
+                    v = PDF_FLOOR
+                return log(v)
+
+            f_plus = _eval_logpdf(g_t[t] + F_DIFF_H)
+            f_minus = _eval_logpdf(g_t[t] - F_DIFF_H)
+            scores[t] = (f_plus - f_minus) / (2.0 * F_DIFF_H)
+
+        if not np.isfinite(scores[t]):
+            scores[t] = 0.0
+        scores[t] = max(min(scores[t], SCORE_CLAMP), -SCORE_CLAMP)
+
+        # ----------------------------------------------------------------
+        # 4. FIGAS(1,d,0) recursion:  y_{t+1} = alpha*s_t - sum_psi_y
+        # ----------------------------------------------------------------
+        if t < T_len - 1:
+            sum_psi_y = 0.0
+            L = 100
+            max_j = min(L, t + 1)
+            for j in range(1, max_j + 1):
+                sum_psi_y += psi[j - 1] * y[t + 1 - j]
+            y[t + 1] = alpha * scores[t] - sum_psi_y
+
+            if not np.isfinite(y[t + 1]):
+                y[t + 1] = 0.0
+            y[t + 1] = max(min(y[t + 1], 29.0), -29.0)
+            g_t[t + 1] = mu + y[t + 1]
+
+    # ── Compute h-functions ─────────────────────────────────────────────
+    h1 = np.zeros(T_len)
+    h2 = np.zeros(T_len)
+    n_h_fallback = 0
+    for t in range(T_len):
+        h1[t], h2[t] = _safe_bicop_hfunc(u1[t], u2[t], family=fam_id,
+                                           par=par_t[t], par2=kappa)
+        if h1[t] == u1[t] and h2[t] == u2[t]:
+            n_h_fallback += 1
+
+    if n_h_fallback > 0:
+        import warnings
+        warnings.warn(f"FIGAS-d0 filter: {n_h_fallback}/{T_len} h-function "
+                      f"evaluations fell back to independence copula", RuntimeWarning)
+    return dict(
+        loglik=float(np.sum(ll_seq)),
+        ll_seq=ll_seq,
+        par_t=par_t,
+        h1=h1,
+        h2=h2,
+        y=y,
+    )
+
+
+def estimate_figas_d0_params(u1, u2, fam_id, verbose=True):
+    """
+    Estimate FIGAS(1,d,0) parameters via multi-start L-BFGS-B.
+
+    Tests multiple starting values for d: 0.1, 0.2, 0.35, 0.45.
+    Picks the best log-likelihood across all starts.
+
+    Parameters
+    ----------
+    u1, u2 : np.ndarray (1D)
+        Uniform pseudo-observations.
+    fam_id : int
+        Copula family code: 2=t, 3=Clayton, 14=Survival Gumbel, 23=Clayton 90-rotated.
+    verbose : bool
+        If True, print estimation progress.
+
+    Returns
+    -------
+    best_params : np.ndarray
+        Estimated parameters [mu, alpha, d] (plus kappa if t).
+    filtered_result : dict
+        Filter output from filter_figas_d0() at the optimum.
+    """
+    rng = np.random.RandomState(SEED)
+
+    u1a = np.asarray(u1, dtype=float).ravel()
+    u2a = np.asarray(u2, dtype=float).ravel()
+
+    # ── Step 1: Static copula estimation for start_mu ────────────────────
+    static_par, static_par2 = _static_copula_fit(u1a, u2a, fam_id)
+    start_mu = _inverse_link(fam_id, static_par)
+    start_mu = max(min(start_mu, 5.0), -5.0)
+
+    if verbose:
+        suffix = f", static_kappa={static_par2:.2f}" if fam_id == 2 else ""
+        print(f"  [FIGAS-d0] family={fam_id}, static_par={static_par:.4f}{suffix}, "
+              f"start_mu={start_mu:.4f}")
+
+    # ── Common objective ─────────────────────────────────────────────────
+    def _objective(theta_vec):
+        try:
+            tmp = filter_figas_d0(theta_vec, u1a, u2a, fam_id)
             ll = tmp["loglik"]
             if not np.isfinite(ll):
                 return 1e10
@@ -728,67 +1000,68 @@ def estimate_figas_params_lbfgsb(u1, u2, fam_id, verbose=True):
         except Exception:
             return 1e10
 
-    if verbose:
-        labels = ["mu", "alpha", "beta", "d"]
-        if fam_id == 2:
-            labels.append("kappa")
-        init_str = ", ".join(
-            f"{labels[i]}={init_par[i]:.4f}" for i in range(len(init_par))
-        )
-        print(f"    Initial params: {init_str}")
-        print(f"    Optimising via L-BFGS-B (multi-start) ...")
+    # ── Build bounds ─────────────────────────────────────────────────────
+    mu_lo = max(start_mu - 5.0, FIGAS_BOUNDS["mu"][0])
+    mu_hi = min(start_mu + 5.0, FIGAS_BOUNDS["mu"][1])
+    lower = np.array([mu_lo, FIGAS_BOUNDS["alpha"][0], 0.001])
+    upper = np.array([mu_hi, FIGAS_BOUNDS["alpha"][1], 0.49])
+    if fam_id == 2:
+        lower = np.append(lower, FIGAS_BOUNDS["kappa"][0])
+        upper = np.append(upper, FIGAS_BOUNDS["kappa"][1])
 
+    # ── Multi-start over different d initial values ──────────────────────
+    d_starts = [0.1, 0.2, 0.35, 0.45]
     best_nll = np.inf
-    best_x = init_par.copy()
+    best_x = None
+    best_res = None
+    best_tag = ""
 
-    n_restarts = 3
-    for restart in range(n_restarts):
-        if restart == 0:
-            x_init = init_par.copy()
-        else:
-            x_init = init_par.copy()
-            # perturb
-            x_init[0] += rng.normal(0, 0.5)          # mu
-            x_init[1] *= np.exp(rng.normal(0, 0.3))  # alpha
-            x_init[2] += rng.normal(0, 0.1)          # beta
-            x_init[3] += rng.uniform(-0.1, 0.1)      # d
-            if fam_id == 2:
-                x_init[4] += rng.normal(0, 3.0)      # kappa
-            # clip to bounds
-            x_init = np.clip(x_init, lower + 1e-8, upper - 1e-8)
+    import sys as _sys
 
-        try:
-            opt_result = minimize(
-                _objective,
-                x0=x_init,
-                method="L-BFGS-B",
-                bounds=list(zip(lower, upper)),
-                options={"maxiter": 300, "maxfun": 500, "ftol": 1e-8},
-            )
-            if opt_result.fun < best_nll:
-                best_nll = opt_result.fun
-                best_x = opt_result.x
-        except Exception:
-            continue
+    for d0 in d_starts:
+        init = np.array([start_mu, 0.05, d0], dtype=float)
+        if fam_id == 2:
+            init = np.append(init, max(3.0, static_par2))
 
-    # ── Step 5: Final filtered result ───────────────────────────────────
-    fres = filter_figas(best_x, u1a, u2a, fam_id)
+        for restart in range(3):
+            x0 = init.copy()
+            if restart > 0:
+                x0[0] += rng.normal(0, 0.5)
+                x0[1] *= np.exp(rng.normal(0, 0.3))
+                x0[2] += rng.uniform(-0.08, 0.08)
+                if fam_id == 2:
+                    x0[3] += rng.normal(0, 3.0)
+            x0 = np.clip(x0, lower + 1e-8, upper - 1e-8)
+
+            try:
+                res = minimize(_objective, x0=x0, method="L-BFGS-B",
+                               bounds=list(zip(lower, upper)),
+                               options={"maxiter": 300, "maxfun": 500, "ftol": 1e-8})
+                if res.fun < best_nll:
+                    best_nll = float(res.fun)
+                    best_x = res.x.copy()
+                    best_tag = f"d0={d0:.2f}, restart={restart}"
+            except Exception:
+                continue
+
+    if best_x is None:
+        raise RuntimeError("FIGAS-d0 estimation failed: all starts returned errors.")
+
+    best_res = filter_figas_d0(best_x, u1a, u2a, fam_id)
 
     if verbose:
-        labels = ["mu", "alpha", "beta", "d"]
+        labels = ["mu", "alpha", "d"]
         if fam_id == 2:
             labels.append("kappa")
-        best_str = ", ".join(
-            f"{labels[i]}={best_x[i]:.4f}" for i in range(len(best_x))
-        )
-        print(f"    Best params:  {best_str}")
-        print(f"    FIGAS-LBFGSB loglik: {fres['loglik']:.2f}  (n={len(u1a)})")
+        best_str = ", ".join(f"{labels[i]}={best_x[i]:.4f}" for i in range(len(best_x)))
+        print(f"    FIGAS-d0 best ({best_tag}): {best_str}")
+        print(f"    FIGAS-d0 loglik: {best_res['loglik']:.2f}  (n={len(u1a)})")
 
-    return best_x, fres
+    return best_x, best_res
 
 
 # ============================================================================
-# 7. Quick smoke-test (runs when executed directly)
+# 8. Quick smoke-test (runs when executed directly)
 # ============================================================================
 
 if __name__ == '__main__':

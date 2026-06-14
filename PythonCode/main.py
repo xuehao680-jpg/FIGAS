@@ -118,7 +118,13 @@ def main():
 
     # 7.4 PIT transform
     print("\n--- 7.4 PIT 变换 ---")
-    u_train_dict = marginal_models.pit_transform(z_dict, shape_dict)
+    if PIT_METHOD == "ecdf":
+        print(f"  [ECDF mode] Using empirical CDF on raw returns (preserving long memory)")
+        u_train_dict = marginal_models.pit_transform(
+            z_dict, shape_dict, returns_df=returns_train
+        )
+    else:
+        u_train_dict = marginal_models.pit_transform(z_dict, shape_dict)
 
     # 7.5 PIT uniformity check
     print("\n--- 7.5 PIT 均匀性检验 ---")
@@ -127,7 +133,8 @@ def main():
     # 7.6 Filter test set
     print("\n--- 7.6 检验集过滤 ---")
     z_test_dict, u_test_dict, test_filter_results = marginal_models.filter_test_set(
-        fit_dict, returns_test, GARCH_SPECS, shape_dict
+        fit_dict, returns_test, GARCH_SPECS, shape_dict,
+        returns_train_df=(returns_train if PIT_METHOD == "ecdf" else None),
     )
 
     # 7.7 Save outputs
