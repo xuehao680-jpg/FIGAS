@@ -170,7 +170,9 @@ def select_vine_structure(u_data):
         print("=== 正在自动构建最优 Vine Copula 结构 (pyvinecopulib) ... ===")
         results = {}
         family_set = [1, 2, 3, 4, 5, 10]
-        pobs_data = pv.to_pseudo_obs(pobs)
+        pobs_mat = np.asarray(pobs, dtype=float, order='F')
+        # pyvinecopulib uses 1-based indexing
+        order_1b = [i + 1 for i in range(n_cols)]
 
         for vtype in ["RVine", "CVine", "DVine"]:
             print(f"  --- {vtype} 选择中 ... ---")
@@ -181,14 +183,13 @@ def select_vine_structure(u_data):
                 show_trace=False
             )
             if vtype == "CVine":
-                s = pv.CVineStructure(list(range(n_cols)))
-                vc = pv.Vinecop(data=pobs_data, controls=ctrl, structure=s)
+                s = pv.CVineStructure.from_order(order_1b)
             elif vtype == "DVine":
-                s = pv.DVineStructure(list(range(n_cols)))
-                vc = pv.Vinecop(data=pobs_data, controls=ctrl, structure=s)
+                s = pv.DVineStructure.from_order(order_1b)
             else:
-                vc = pv.Vinecop(data=pobs_data, controls=ctrl)
-            ll = vc.get_loglik(); ai = vc.get_aic(); bi = vc.get_bic()
+                s = pv.RVineStructure(d=n_cols)
+            vc = pv.Vinecop.from_data(data=pobs_mat, controls=ctrl, structure=s)
+            ll = vc.loglik(pobs_mat); ai = vc.aic(pobs_mat); bi = vc.bic(pobs_mat)
             results[vtype] = {"logLik": ll, "AIC": ai, "BIC": bi}
             print(f"    {vtype}: LogLik={ll:.2f}, AIC={ai:.2f}, BIC={bi:.2f}")
         comparison = pd.DataFrame([
