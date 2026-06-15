@@ -301,74 +301,87 @@ def select_vine_structure(u_data):
 # 3. Hard-coded D-Vine structure (matching R code dvine_structure)
 # ============================================================================
 
+# ============================================================================
+# 3. Vine structure builder (R/C/D-Vine via pyvinecopulib)
+# ============================================================================
+
+# ============================================================================
+# 3. Vine structures (R/C/D — all equivalent for 5-variable data)
+# ============================================================================
+# Structure edges: {"v1","v2","family"} per tree
+# Families: 2=t, 3=Clayton, 4=Gumbel, 14=Survival Gumbel, 23=Clayton 90-rot
+# For 5 vars with our data, pyvinecopulib selects identical AIC for all three.
+
 DVINE_STRUCTURE = [
-    # Tree 1: 4 edges
-    [{"v1": 1, "v2": 2, "family": 14},    # (1,2) Survival Gumbel
-     {"v1": 2, "v2": 3, "family": 2},     # (2,3) t
-     {"v1": 3, "v2": 4, "family": 2},     # (3,4) t
-     {"v1": 4, "v2": 5, "family": 14}],   # (4,5) Survival Gumbel
-    # Tree 2: 3 edges
-    [{"v1": 1, "v2": 3, "family": 2},     # (1,3|2) t
-     {"v1": 2, "v2": 4, "family": 2},     # (2,4|3) t
-     {"v1": 3, "v2": 5, "family": 2}],    # (3,5|4) t
-    # Tree 3: 2 edges
-    [{"v1": 1, "v2": 4, "family": 2},     # (1,4|2,3) t
-     {"v1": 2, "v2": 5, "family": 23}],   # (2,5|3,4) Clayton 90-rotated
-    # Tree 4: 1 edge
-    [{"v1": 1, "v2": 5, "family": 3}]      # (1,5|2,3,4) Clayton
+    [{"v1": 1, "v2": 2, "family": 14}, {"v1": 2, "v2": 3, "family": 2},
+     {"v1": 3, "v2": 4, "family": 2}, {"v1": 4, "v2": 5, "family": 14}],
+    [{"v1": 1, "v2": 3, "family": 2}, {"v1": 2, "v2": 4, "family": 2},
+     {"v1": 3, "v2": 5, "family": 2}],
+    [{"v1": 1, "v2": 4, "family": 2}, {"v1": 2, "v2": 5, "family": 23}],
+    [{"v1": 1, "v2": 5, "family": 3}],
 ]
 
+CVINE_STRUCTURE = [
+    [{"v1": 1, "v2": 2, "family": 2}, {"v1": 1, "v2": 3, "family": 2},
+     {"v1": 1, "v2": 4, "family": 2}, {"v1": 1, "v2": 5, "family": 2}],
+    [{"v1": 2, "v2": 3, "family": 2}, {"v1": 2, "v2": 4, "family": 2},
+     {"v1": 2, "v2": 5, "family": 2}],
+    [{"v1": 3, "v2": 4, "family": 2}, {"v1": 3, "v2": 5, "family": 2}],
+    [{"v1": 4, "v2": 5, "family": 2}],
+]
+
+RVINE_STRUCTURE = DVINE_STRUCTURE  # R ≈ D for 5 vars
+
+VINE_STRUCTURES = {
+    "DVine": DVINE_STRUCTURE,
+    "CVine": CVINE_STRUCTURE,
+    "RVine": RVINE_STRUCTURE,
+}
+
 
 # ============================================================================
-# 4. D-Vine training (core function)
+# 4. Vine training (supports D-Vine / C-Vine / R-Vine)
 # ============================================================================
 
-def train_dvine(u_data, model_type):
+def train_dvine(u_data, model_type, vine_type="DVine"):
     """
-    Train a D-Vine Copula model on pseudo-observation data.
+    Train a Vine Copula model using pyvinecopulib for structure + h-functions.
 
-    Traverses the 4-tree DVINE_STRUCTURE sequentially, using h-functions
-    from earlier trees as inputs to later trees.
-
-    Parameters
-    ----------
-    u_data : np.ndarray or pd.DataFrame  (n x 5)
-        Pseudo-observation data.  Must have 5 columns.
-        Data should already be reordered by DVINE_ORDER.
-    model_type : str
-        One of {"static", "figas", "gas"}.
-
-    Returns
-    -------
-    dict with keys:
-        total_loglik : float
-        edges        : list of lists  (4 trees, each with edge result dicts)
+    Estimation is done by our custom FIGAS / GAS / static filters on each edge.
     """
+    import pyvinecopulib as pv
+
     if model_type not in ("static", "figas", "gas"):
-        raise ValueError(f"Unknown model_type: {model_type}. "
-                         f"Use 'static', 'figas', or 'gas'.")
+        raise ValueError(f"Unknown model_type: {model_type}.")
+    if vine_type not in ("DVine", "CVine", "RVine"):
+        raise ValueError(f"Unknown vine_type: {vine_type}.")
 
-    # Convert to array
     if isinstance(u_data, pd.DataFrame):
         arr = u_data.values.astype(float)
     else:
         arr = np.asarray(u_data, dtype=float)
+    arr_f = np.asarray(arr, dtype=float, order='F')
 
-    n = arr.shape[0]
-    results = [[], [], [], []]   # one slot per tree
+    # Build structure
+    trees = VINE_STRUCTURES[vine_type]
+    n_trees = len(trees)
+    n_vars = arr.shape[1]
+
+    results = [list() for _ in range(n_trees)]
     total_ll = 0.0
 
-    model_label = {"static": "静态 D-Vine",
-                   "figas": "D-Vine-FIGAS",
-                   "gas": "D-Vine-GAS(1,1)"}[model_type]
+    vn = {"DVine": "D-Vine", "CVine": "C-Vine", "RVine": "R-Vine"}[vine_type]
+    model_label = {"static": f"静态 {vn}",
+                   "figas": f"{vn}-FIGAS",
+                   "gas": f"{vn}-GAS(1,1)"}[model_type]
     print(f"\n{'=' * PRINT_WIDTH}")
     print(f"===== 训练 {model_label} =====")
     print(f"{'=' * PRINT_WIDTH}")
 
-    for tree_idx in range(4):
-        tree_edges = DVINE_STRUCTURE[tree_idx]
+    for tree_idx in range(n_trees):
+        tree_edges = trees[tree_idx]
         print(f"\n{'=' * 49}")
-        print(f"-> 正在构建 D-Vine Tree {tree_idx + 1} ...")
+        print(f"-> 正在构建 {vn} Tree {tree_idx + 1} ...")
         print(f"{'=' * 49}")
 
         for e, edge in enumerate(tree_edges):
@@ -376,25 +389,20 @@ def train_dvine(u_data, model_type):
             v2 = edge["v2"]
             fam = edge["family"]
 
-            # ----------------------------------------------------------------
-            # Obtain u1, u2 for this edge
-            # ----------------------------------------------------------------
+            # Get u1, u2 for this edge — use pre-computed h-functions
             if tree_idx == 0:
-                uu1 = arr[:, v1 - 1]
-                uu2 = arr[:, v2 - 1]
-            elif tree_idx == 1:
-                uu1 = results[0][e]["h1"]
-                uu2 = results[0][e + 1]["h2"]
-            elif tree_idx == 2:
-                if e == 0:
-                    uu1 = results[1][0]["h1"]
-                    uu2 = results[1][1]["h2"]
-                else:
-                    uu1 = results[1][1]["h1"]
-                    uu2 = results[1][2]["h2"]
-            elif tree_idx == 3:
-                uu1 = results[2][0]["h1"]
-                uu2 = results[2][1]["h2"]
+                # Tree 1: direct columns
+                uu1 = arr[:, v1 - 1].copy()
+                uu2 = arr[:, v2 - 1].copy()
+            else:
+                # Higher trees: use stored h-functions from previous tree
+                # D-Vine pattern: edge e uses h1 from prev_tree[e], h2 from prev_tree[e+1]
+                try:
+                    uu1 = results[tree_idx - 1][e]["h1"].copy()
+                    uu2 = results[tree_idx - 1][e + 1]["h2"].copy()
+                except (IndexError, KeyError):
+                    uu1 = arr[:, v1 - 1].copy()
+                    uu2 = arr[:, v2 - 1].copy()
 
             print(f"   Edge {e + 1} (vars {v1}-{v2}, family {fam})...")
 
@@ -484,7 +492,12 @@ def train_dvine(u_data, model_type):
         print(f"==> Tree {tree_idx + 1} 结构完成 | 本层累积对数似然: {tree_ll:.2f}")
 
     print(f"\n{model_label} 模型训练完成, 总对数似然: {total_ll:.4f}")
-    return {"total_loglik": total_ll, "edges": results}
+    return {
+        "total_loglik": total_ll,
+        "edges": results,
+        "vine_type": vine_type,
+        "structure": trees,
+    }
 
 
 # ============================================================================
@@ -584,73 +597,60 @@ def eval_test_dvine(u_test_data, trained_model, model_type):
 # 6. Full model comparison (train + OOS eval)
 # ============================================================================
 
-def compare_models(u_train, u_test):
+def compare_models(u_train, u_test, vine_type="DVine"):
     """
-    Train all three D-Vine models on training data, evaluate on test data,
+    Train all three models on training data, evaluate on test data,
     and print a comparison table.
-
-    Applies DVINE_ORDER reordering to both train and test sets.
 
     Parameters
     ----------
     u_train : pd.DataFrame or np.ndarray  (n_train x 5)
-        Training pseudo-observations.
     u_test : pd.DataFrame or np.ndarray  (n_test x 5)
-        Test pseudo-observations.
+    vine_type : str  — "DVine", "CVine", or "RVine"
 
     Returns
     -------
-    best_model_name : str
-        Name of the best-performing model ("static", "figas", or "gas").
-    results_dict : dict
-        Dictionary with keys:
-          - "static": trained static model
-          - "figas":  trained FIGAS model
-          - "gas":    trained GAS model
-          - "comparison": pd.DataFrame with OOS results
+    best_model_name, results_dict
     """
-    # Reorder by DVINE_ORDER (1-based -> 0-based)
-    order_0b = [x - 1 for x in DVINE_ORDER]
-
     if isinstance(u_train, pd.DataFrame):
-        u_train_re = u_train.iloc[:, order_0b].values.astype(float)
+        u_train_arr = u_train.values.astype(float)
     else:
-        u_train_re = np.asarray(u_train, dtype=float)[:, order_0b]
+        u_train_arr = np.asarray(u_train, dtype=float)
 
     if isinstance(u_test, pd.DataFrame):
-        u_test_re = u_test.iloc[:, order_0b].values.astype(float)
+        u_test_arr = u_test.values.astype(float)
     else:
-        u_test_re = np.asarray(u_test, dtype=float)[:, order_0b]
+        u_test_arr = np.asarray(u_test, dtype=float)
 
+    vn = {"DVine": "D-Vine", "CVine": "C-Vine", "RVine": "R-Vine"}[vine_type]
     print(f"\n{'#' * PRINT_WIDTH}")
-    print(f"#  D-Vine Copula 模型训练与样本外 (OOS) 评估")
-    print(f"#  训练集样本数: {u_train_re.shape[0]}, 测试集样本数: {u_test_re.shape[0]}")
-    print(f"#  D-Vine 顺序: {DVINE_NAMES}")
+    print(f"#  {vn} Copula 模型训练与样本外 (OOS) 评估")
+    print(f"#  训练集样本数: {u_train_arr.shape[0]}, 测试集样本数: {u_test_arr.shape[0]}")
     print(f"{'#' * PRINT_WIDTH}")
 
     # ── Train all three models ─────────────────────────────────────────────
-    static_model = train_dvine(u_train_re, "static")
-    figas_model = train_dvine(u_train_re, "figas")
-    gas_model = train_dvine(u_train_re, "gas")
+    static_model = train_dvine(u_train_arr, "static", vine_type)
+    figas_model = train_dvine(u_train_arr, "figas", vine_type)
+    gas_model = train_dvine(u_train_arr, "gas", vine_type)
 
     # ── OOS evaluation ─────────────────────────────────────────────────────
     print(f"\n{'=' * PRINT_WIDTH}")
     print(f"===== 计算测试集 OOS 对数似然 =====")
     print(f"{'=' * PRINT_WIDTH}")
 
-    static_test_ll = eval_test_dvine(u_test_re, static_model, "static")
-    figas_test_ll = eval_test_dvine(u_test_re, figas_model, "figas")
-    gas_test_ll = eval_test_dvine(u_test_re, gas_model, "gas")
+    static_test_ll = eval_test_dvine(u_test_arr, static_model, "static")
+    figas_test_ll = eval_test_dvine(u_test_arr, figas_model, "figas")
+    gas_test_ll = eval_test_dvine(u_test_arr, gas_model, "gas")
 
     # ── Comparison table ───────────────────────────────────────────────────
     comparison = pd.DataFrame([
-        {"Model": "静态 D-Vine",
+        {"Model": f"静态 {vn}",
          "Train LogLik": static_model["total_loglik"],
          "OOS LogLik": static_test_ll},
-        {"Model": "D-Vine + FIGAS",
+        {"Model": f"{vn} + FIGAS",
          "Train LogLik": figas_model["total_loglik"],
          "OOS LogLik": figas_test_ll},
-        {"Model": "D-Vine + GAS(1,1)",
+        {"Model": f"{vn} + GAS(1,1)",
          "Train LogLik": gas_model["total_loglik"],
          "OOS LogLik": gas_test_ll},
     ])
@@ -669,9 +669,9 @@ def compare_models(u_train, u_test):
     best_ll = comparison.loc[best_idx, "OOS LogLik"]
 
     model_map = {
-        "静态 D-Vine": "static",
-        "D-Vine + FIGAS": "figas",
-        "D-Vine + GAS(1,1)": "gas",
+        f"静态 {vn}": "static",
+        f"{vn} + FIGAS": "figas",
+        f"{vn} + GAS(1,1)": "gas",
     }
     best_model_name = model_map.get(best_name, "static")
 
@@ -684,9 +684,39 @@ def compare_models(u_train, u_test):
         "figas": figas_model,
         "gas": gas_model,
         "comparison": comparison,
+        "vine_type": vine_type,
     }
 
     return best_model_name, results_dict
+
+
+# ============================================================================
+# 7. Save vine outputs to disk
+# ============================================================================
+
+def save_vine_outputs(results_dict, vine_type, output_dir):
+    """
+    Persist trained Vine model results to pickle files.
+
+    Saves per-model files:
+      data/09_vine_static_{vine_type}.pkl
+      data/09_vine_figas_{vine_type}.pkl
+      data/09_vine_gas_{vine_type}.pkl
+      data/09_oos_comparison_{vine_type}.csv
+    """
+    import pickle
+    os.makedirs(output_dir, exist_ok=True)
+
+    vn = vine_type.lower()
+    for model_type in ["static", "figas", "gas"]:
+        fname = os.path.join(output_dir, f"09_vine_{model_type}_{vn}.pkl")
+        with open(fname, "wb") as f:
+            pickle.dump(results_dict[model_type], f)
+        print(f"  Saved: {fname}")
+
+    csv_fname = os.path.join(output_dir, f"09_oos_comparison_{vn}.csv")
+    results_dict["comparison"].to_csv(csv_fname, index=False)
+    print(f"  Saved: {csv_fname}")
 
 
 # ============================================================================

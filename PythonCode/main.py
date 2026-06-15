@@ -156,29 +156,58 @@ def main():
     # Kendall's tau
     tau_mat = vine_copula.kendall_tau_matrix(u_train_df)
 
-    # Vine structure selection (R/C/D-Vine comparison)
+    # Vine structure selection (R/C/D-Vine comparison via pyvinecopulib)
     comparison = vine_copula.select_vine_structure(u_train_df)
 
+    # Save module 8 comparison
+    comp_csv = DATA_DIR / "08_vine_comparison.csv"
+    comparison.to_csv(comp_csv, index=False)
+    print(f"\n模块 8 输出 → {comp_csv}")
+
+    # Determine best vine type from comparison (by AIC)
+    best_aic_idx = comparison["AIC"].idxmin()
+    best_vine_str = comparison.loc[best_aic_idx, "Model"]  # "R-vine", "C-vine", "D-vine"
+    vine_type_map = {"R-vine": "RVine", "C-vine": "CVine", "D-vine": "DVine"}
+    best_vine_type = vine_type_map.get(best_vine_str, "DVine")
+    print(f"最优 Vine 结构: {best_vine_str} → 模块 9 将使用 {best_vine_type}")
+
     # ====================================================================
-    # 模块 9: D-Vine 动态 Copula (静态 vs FIGAS vs GAS)
+    # 模块 9: R/C/D-Vine 动态 Copula (静态 vs FIGAS vs GAS)
     # ====================================================================
     print("\n" + "=" * PRINT_WIDTH)
-    print("模块 9: D-Vine 动态 Copula 建模")
+    print(f"模块 9: {best_vine_str} 动态 Copula 建模 (含 R/C/D 对比)")
     print("=" * PRINT_WIDTH)
 
     u_test_df = pd.DataFrame(u_test_dict)[ASSETS]
 
-    best_model, results = vine_copula.compare_models(u_train_df, u_test_df)
+    all_results = {}
+    for vt, vt_label in [("DVine", "D-Vine"), ("CVine", "C-Vine"), ("RVine", "R-Vine")]:
+        print(f"\n{'~' * PRINT_WIDTH}")
+        print(f"  训练 {vt_label} 结构 ...")
+        print(f"{'~' * PRINT_WIDTH}")
+        best_model, results = vine_copula.compare_models(u_train_df, u_test_df, vine_type=vt)
+        vine_copula.save_vine_outputs(results, vt, str(DATA_DIR))
+        all_results[vt] = results
+
+    # Use best vine type as final
+    final_results = all_results.get(best_vine_type, all_results["DVine"])
+    best_model = max(
+        [(vt, r["comparison"].loc[r["comparison"]["OOS LogLik"].idxmax(), "OOS LogLik"])
+         for vt, r in all_results.items()],
+        key=lambda x: x[1]
+    )[0]
 
     # ====================================================================
     # 完成
     # ====================================================================
     print("\n" + "=" * PRINT_WIDTH)
     print("分析完成!")
+    print(f"最优 Vine 结构: {best_vine_str}")
     print(f"最优模型: {best_model}")
+    print(f"中间数据已保存至: {DATA_DIR}")
     print("=" * PRINT_WIDTH)
 
-    return results
+    return final_results
 
 
 if __name__ == "__main__":
