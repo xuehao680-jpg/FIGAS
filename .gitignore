@@ -18,7 +18,5 @@ env/
 Thumbs.db
 
 # Data output files
-data/*.csv
-data/*.pkl
 data/*.png
 .venv/
